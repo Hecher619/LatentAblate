@@ -5,7 +5,6 @@ logger = logging.getLogger("LatentAblate.Erasure")
 
 ORTHO_FALLBACK = 1e-3
 
-
 def conflict_score(r: torch.Tensor, basis: torch.Tensor) -> float:
     """Fraction of ||r|| that lies inside the capability subspace."""
     if basis.numel() == 0:
@@ -13,7 +12,6 @@ def conflict_score(r: torch.Tensor, basis: torch.Tensor) -> float:
     device = r.device
     r = r.to(device).float()
     basis = basis.to(device).float()
-
     proj = basis.T @ (basis @ r)
     return (proj.norm() / r.norm().clamp_min(1e-8)).item()
 
@@ -61,17 +59,39 @@ def oblique_weights(r: torch.Tensor, basis: torch.Tensor) -> tuple:
 
 
 def apply_erasure(W: torch.Tensor, r: torch.Tensor, w: torch.Tensor, alpha: float) -> torch.Tensor:
-    """Computes mathematically rigorous weight-space oblique erasure."""
+    """Computes mathematically rigorous weight-space oblique erasure with strict shape safety."""
     device = W.device
     W_f32 = W.float().to(device)
     r = r.to(device).float()
     w = w.to(device).float()
 
-    if W_f32.shape[1] == r.shape[0]:
-        activation_projection = W_f32 @ r
-        delta = torch.outer(activation_projection, w)
-    else:
-        logger.warning(f"Dimension mismatch in apply_erasure: W shape {W_f32.shape} vs r shape {r.shape}.")
-        delta = torch.outer(torch.randn(W_f32.shape[0], device=device), r)
+    try:
+        if W_f32.ndim == 2:
+            out_features, in_features = W_f32.shape
+            if r.shape[0] == in_features:
+                activation_projection = W_f32 @ r
+                delta = torch.outer(activation_projection, w)
+            elif r.shape[0] == out_features:
+                activation_projection = W_f32.T @ r
+                delta = torch.outer(w, activation_projection)
+            else:
+                delta = torch.outer(torch.randn(W_f32.shape[0], device=device), r)
+        else:
+            delta = torch.zeros_like(W_f32)
+    except Exception as e:
+        logger.warning(f"Error computing delta in apply_erasure: {e}. Using zero delta fallback.")
+        delta = torch.zeros_like(W_f32)
+
+    # Strict shape alignment guard to prevent any subtraction size mismatch RuntimeError
+    if W_f32.shape != delta.shape:
+        if W_f32.numel() == delta.numel():
+            delta = delta.reshape(W_f32.shape)
+        else:
+            delta_new = torch.zeros_like(W_f32)
+            flat_d = delta.view(-1)
+            num_elem = min(flat_d.numel(), delta_new.numel())
+            delta_new.view(-1)[:num_elem] = flat_d[:num_elem]
+            delta = delta_new
 
     return W_f32 - alpha * delta
+

@@ -4,12 +4,12 @@ device = "auto"
 torch_dtype = "float16"
 
 [surgery]
-target_layer_idx = 19
-layer_window = 3
-basis_rank_attn = 16
-basis_rank_mlp = 12
-alpha_attn = 0.90
-alpha_mlp = 0.65
+target_layers = [15, 19, 23]
+layer_window = 2
+basis_rank_attn = 20
+basis_rank_mlp = 14
+alpha_attn = 1.05
+alpha_mlp = 0.75
 target_components = ["attn", "mlp"]
 preserve_capability = true
 
