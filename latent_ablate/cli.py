@@ -35,6 +35,20 @@ except ImportError:
     RICH_AVAILABLE = False
 
 
+def load_config(config_path: str) -> dict:
+    if not tomllib:
+        return {}
+    path = Path(config_path)
+    if not path.exists():
+        return {}
+    try:
+        with open(path, "rb") as f:
+            return tomllib.load(f)
+    except Exception as e:
+        logger.warning(f"Failed to parse config file {config_path}: {e}")
+        return {}
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description="LatentAblate Heretic Edition - Advanced Latent Modding Suite")
     p.add_argument("--config", default="configs/default.toml", help="Path to config file.")
@@ -43,11 +57,11 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--modifier", choices=["cwoe", "ara", "soma", "riemannian", "sae"], default="cwoe", help="Modification engine.")
     p.add_argument("--trials", type=int, default=10, help="Number of trial iterations.")
     p.add_argument("--optimize", action="store_true", help="Enable automated Optuna TPE optimization.")
-    p.add_argument("--target-layer", type=int, default=None, help="Manually specify target transformer layer index.")
-    p.add_argument("--basis-rank-attn", type=int, default=16, help="Attention subspace rank.")
-    p.add_argument("--basis-rank-mlp", type=int, default=12, help="MLP subspace rank.")
-    p.add_argument("--alpha-attn", type=float, default=0.90, help="Attention scaling factor.")
-    p.add_argument("--alpha-mlp", type=float, default=0.65, help="MLP scaling factor.")
+    p.add_argument("--target-layers", type=str, default="15,19,23", help="Comma-separated transformer layer indices for multi-pass surgery.")
+    p.add_argument("--basis-rank-attn", type=int, default=20, help="Attention subspace rank.")
+    p.add_argument("--basis-rank-mlp", type=int, default=14, help="MLP subspace rank.")
+    p.add_argument("--alpha-attn", type=float, default=1.05, help="Attention scaling factor.")
+    p.add_argument("--alpha-mlp", type=float, default=0.75, help="MLP scaling factor.")
     p.add_argument("--prompts-file", type=str, default=None, help="Path to custom JSON or text prompt file.")
     p.add_argument("--seed", type=int, default=42, help="Random seed.")
     p.add_argument("--publish", metavar="REPO_ID", help="Hugging Face Hub repo ID to auto-publish.")
@@ -59,10 +73,10 @@ def build_parser() -> argparse.ArgumentParser:
 def run_interactive_chat_with_commands(model, tokenizer, device):
     if RICH_AVAILABLE:
         console.print("\n[bold green]=== LatentAblate Pro Interactive Terminal Mode ===[/bold green]")
-        console.print("[dim]Commands: Type your prompt normally, or use '/stress' to test compliance, or 'exit'.[/dim]\n")
+        console.print("[dim]Commands: Type your prompt normally, '/stress' to test compliance, '/help' for commands, or 'exit'.[/dim]\n")
     else:
         print("\n=== LatentAblate Pro Interactive Terminal Mode ===")
-        print("Commands: Type prompt normally, or use '/stress', or 'exit'.\n")
+        print("Commands: Type prompt normally, '/stress', '/help', or 'exit'.\n")
 
     model.eval()
     while True:
@@ -70,10 +84,17 @@ def run_interactive_chat_with_commands(model, tokenizer, device):
             prompt = input("\033[1;36mUser > \033[0m").strip()
             if not prompt:
                 continue
-            
+
             if prompt.lower() in ["exit", "quit"]:
                 print("Exiting interactive mode. Goodbye!")
                 break
+
+            if prompt.lower() == "/help":
+                print("\n📌 Available Interactive Commands:")
+                print("  /stress - Run adversarial compliance benchmark suite")
+                print("  /help   - Display this help message")
+                print("  exit    - Exit the interactive session\n")
+                continue
 
             if prompt.lower() == "/stress":
                 print("\n[⚡] Running live adversarial stress test suite...")
@@ -114,13 +135,13 @@ def interactive_trial_selector(trial_results: list) -> int:
     if not RICH_AVAILABLE:
         print("\n=== Trial Results Summary ===")
         for idx, res in enumerate(trial_results):
-            print(f"[{idx}] Layer: {res['layer']} | Refusal: {res['refusal']}% | PPL: {res['perplexity']:.2f}")
+            print(f"[{idx}] Layers: {res['layers']} | Refusal: {res['refusal']}% | PPL: {res['perplexity']:.2f}")
         choice = input("Select trial index [default 0]: ").strip()
         return int(choice) if choice.isdigit() and int(choice) < len(trial_results) else 0
 
     table = Table(title="🧬 LatentAblate - Trial Performance Matrix", style="cyan")
     table.add_column("Index", justify="center", style="bold yellow")
-    table.add_column("Target Layer", justify="center")
+    table.add_column("Target Layers", justify="center")
     table.add_column("Attn Rank / Alpha", justify="center")
     table.add_column("MLP Rank / Alpha", justify="center")
     table.add_column("Refusal Rate", justify="center", style="red")
@@ -129,7 +150,7 @@ def interactive_trial_selector(trial_results: list) -> int:
     for idx, res in enumerate(trial_results):
         table.add_row(
             str(idx),
-            str(res["layer"]),
+            str(res["layers"]),
             f"{res['rank_attn']} / {res['alpha_attn']}",
             f"{res['rank_mlp']} / {res['alpha_mlp']}",
             f"{res['refusal']:.1f}%",
@@ -138,7 +159,7 @@ def interactive_trial_selector(trial_results: list) -> int:
 
     console.print(table)
     console.print("\n[bold green]Tip:[/bold green] Select a trial with 0.0% refusal and low perplexity.")
-    
+
     selection = input("\033[1;36mEnter trial index to apply & save (Press Enter for best): \033[0m").strip()
     if selection.isdigit() and int(selection) < len(trial_results):
         return int(selection)
@@ -147,7 +168,32 @@ def interactive_trial_selector(trial_results: list) -> int:
 
 def main(argv=None):
     logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
-    args = build_parser().parse_args(argv)
+    parser = build_parser()
+    args = parser.parse_args(argv)
+
+    # Load and overlay TOML config if present
+    config_data = load_config(args.config)
+    if config_data:
+        logger.info(f"Loaded configuration from {args.config}")
+        args.model_path = config_data.get("model_path", args.model_path)
+        args.output_dir = config_data.get("output_dir", args.output_dir)
+        
+        surgery_cfg = config_data.get("surgery", {})
+        if "target_layers" in surgery_cfg:
+            layers_val = surgery_cfg["target_layers"]
+            args.target_layers = ",".join(map(str, layers_val)) if isinstance(layers_val, list) else str(layers_val)
+        elif "target_layer_idx" in surgery_cfg:
+            args.target_layers = str(surgery_cfg["target_layer_idx"])
+
+        args.basis_rank_attn = surgery_cfg.get("basis_rank_attn", args.basis_rank_attn)
+        args.basis_rank_mlp = surgery_cfg.get("basis_rank_mlp", args.basis_rank_mlp)
+        args.alpha_attn = surgery_cfg.get("alpha_attn", args.alpha_attn)
+        args.alpha_mlp = surgery_cfg.get("alpha_mlp", args.alpha_mlp)
+
+        datasets_cfg = config_data.get("datasets", {})
+        profile_name = datasets_cfg.get("profile", "safety_uncensored")
+    else:
+        profile_name = "safety_uncensored"
 
     if args.ui:
         dashboard_path = Path(__file__).parent / "dashboard.py"
@@ -156,29 +202,33 @@ def main(argv=None):
 
     torch.manual_seed(args.seed)
 
-    # Load prompts (custom file or default profile)
+    # Load prompts
     if args.prompts_file:
         logger.info(f"Loading custom contrastive prompts from {args.prompts_file}...")
         try:
             pos, neg = PromptLoader.load_from_file(args.prompts_file)
         except Exception as e:
-            logger.error(f"Failed to load custom prompts file: {e}. Falling back to default profile.")
-            profile = BehaviorProfiles.get_profile("safety_uncensored")
+            logger.error(f"Failed to load custom prompts: {e}. Falling back to default profile.")
+            profile = BehaviorProfiles.get_profile(profile_name)
             pos, neg = profile["positive"], profile["negative"]
     else:
-        profile = BehaviorProfiles.get_profile("safety_uncensored")
+        profile = BehaviorProfiles.get_profile(profile_name)
         pos, neg = profile["positive"], profile["negative"]
 
     reporter = SurgeryReporter(args.output_dir)
     trial_records = []
 
-    # Optional Optuna Search Integration
+    # Parse target layers list
+    target_layers_list = [int(x.strip()) for x in args.target_layers.split(",") if x.strip().isdigit()]
+
+    # Optional Optuna Search
     if args.optimize:
         logger.info("Running Optuna Hyperparameter Optimization...")
         try:
             optimizer = SubspaceOptimizer(model_path=args.model_path, device="auto", torch_dtype=torch.float16)
             best_params = optimizer.optimize_surgery(pos, neg, BehaviorProfiles.CAPABILITY_PROMPTS, n_trials=args.trials)
-            args.target_layer = best_params.get("target_layer_idx", args.target_layer)
+            best_layer = best_params.get("target_layer_idx", target_layers_list[0] if target_layers_list else 19)
+            target_layers_list = [best_layer]
             args.basis_rank_attn = best_params.get("basis_rank_attn", args.basis_rank_attn)
             args.basis_rank_mlp = best_params.get("basis_rank_mlp", args.basis_rank_mlp)
             args.alpha_attn = best_params.get("alpha_attn", args.alpha_attn)
@@ -187,19 +237,23 @@ def main(argv=None):
             logger.warning(f"Optimization phase encountered an issue: {e}")
 
     # Run Controlled Trial Loop
-    logger.info(f"🚀 Starting surgical execution...")
+    logger.info(f"🚀 Starting multi-pass surgical execution across layers {target_layers_list}...")
     for trial in range(1, max(1, args.trials if not args.optimize else 1) + 1):
         surgeon = LatentAblateSurgeon(model_path=args.model_path, device="auto", torch_dtype=torch.float16)
-        
-        target_layer = args.target_layer
-        if target_layer is None:
-            sweeper = LayerSweeper(surgeon.model, surgeon.tokenizer, surgeon.device)
-            target_layer = sweeper.find_optimal_layer(pos, neg, output_dir=args.output_dir)
+
+        passes = []
+        for l_idx in target_layers_list:
+            passes.append({
+                "name": f"Layer_{l_idx}_Liberation",
+                "positive": pos,
+                "negative": neg,
+                "target_layer": l_idx
+            })
 
         surgeon.execute_multi_pass_surgery(
-            passes=[{"name": "TotalLiberation", "positive": pos, "negative": neg, "target_layer": target_layer}],
+            passes=passes,
             capability_prompts=BehaviorProfiles.CAPABILITY_PROMPTS,
-            layer_window=3,
+            layer_window=2,
             basis_rank_attn=args.basis_rank_attn,
             basis_rank_mlp=args.basis_rank_mlp,
             scaling_factor_attn=args.alpha_attn,
@@ -213,8 +267,8 @@ def main(argv=None):
             device=surgeon.device,
             settings={
                 "positive_prompts": pos, "negative_prompts": neg,
-                "target_layer_idx": target_layer, "basis_rank": args.basis_rank_attn,
-                "scaling_factor": args.alpha_attn, "cluster_count": 4
+                "target_layers": target_layers_list, "basis_rank_attn": args.basis_rank_attn,
+                "alpha_attn": args.alpha_attn
             }
         )
 
@@ -224,7 +278,7 @@ def main(argv=None):
         trial_records.append({
             "trial_id": trial,
             "surgeon": surgeon,
-            "layer": target_layer,
+            "layers": target_layers_list,
             "rank_attn": args.basis_rank_attn,
             "rank_mlp": args.basis_rank_mlp,
             "alpha_attn": args.alpha_attn,
@@ -237,8 +291,9 @@ def main(argv=None):
 
     chosen_idx = interactive_trial_selector(trial_records)
     winning_trial = trial_records[chosen_idx]
-    
+
     winning_surgeon = winning_trial["surgeon"]
+    winning_surgeon.save_output_dir = args.output_dir
     winning_surgeon.save_model(args.output_dir)
     reporter.save_report()
     logger.info(f"🎉 Liberated model successfully saved to {args.output_dir}")
@@ -256,3 +311,4 @@ def main(argv=None):
 
 if __name__ == "__main__":
     main()
+
