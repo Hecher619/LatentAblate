@@ -26,7 +26,6 @@ def build_capability_basis(activations: torch.Tensor, rank: int = 16) -> torch.T
 
     acts = acts - acts.mean(dim=0, keepdim=True)
     
-    # Use CPU for SVD if GPU memory is constrained, or keep on device
     device = acts.device
     try:
         vh = torch.linalg.svd(acts, full_matrices=False).Vh
@@ -68,6 +67,5 @@ def apply_erasure(W: torch.Tensor, r: torch.Tensor, w: torch.Tensor, alpha: floa
     r = r.to(device).float()
     w = w.to(device).float()
     
-    # Outer product projection ensuring dimensions match residual stream dimensions
     delta = torch.outer(r, w @ W_f32)
     return W_f32 - alpha * delta

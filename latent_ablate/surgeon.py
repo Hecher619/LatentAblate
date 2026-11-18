@@ -51,7 +51,7 @@ class LatentAblateSurgeon:
             if "attn" in target_components and is_attn:
                 targets.append((name, W, 1.0))
             elif "mlp" in target_components and is_mlp:
-                targets.append((name, W, 0.75))
+                targets.append((name, W, 0.95)) # Boosted MLP weight multiplier for maximum override
         return targets
 
     def execute_surgery(
@@ -60,15 +60,15 @@ class LatentAblateSurgeon:
         negative_prompts: list,
         capability_prompts: list,
         target_layer_idx: int,
-        layer_window: int = 2,
+        layer_window: int = 3,        # Expanded default window for robust coverage
         basis_rank: int = 16,
-        scaling_factor: float = 0.75,
+        scaling_factor: float = 1.1,  # Increased default alpha scaling for absolute override
         target_components: list = ["attn", "mlp"],
         preserve_capability: bool = True,
     ):
         start = max(0, target_layer_idx - layer_window)
         end = min(len(self.layers) - 1, target_layer_idx + layer_window)
-        logger.info(f"Executing advanced CWOE across layers {start}..{end} with components: {target_components}")
+        logger.info(f"Executing Advanced CWOE Hyperion Pass across layers {start}..{end} with components: {target_components}")
 
         for idx in tqdm(range(start, end + 1), desc="Advanced Surgical Pass"):
             layer = self.layers[idx]
@@ -76,7 +76,6 @@ class LatentAblateSurgeon:
             if not targets:
                 continue
 
-            # Ensure activations are extracted on the specific layer's device
             layer_device = next(layer.parameters()).device
             
             pos = self.extractor.extract_hidden_states(positive_prompts, idx).to(layer_device)
@@ -90,8 +89,9 @@ class LatentAblateSurgeon:
             self.conflict_table[idx] = conflict
 
             distance_from_peak = abs(idx - target_layer_idx)
-            gaussian_weight = math.exp(-0.5 * (distance_from_peak / max(1, layer_window / 2)) ** 2)
-            alpha = scaling_factor * gaussian_weight
+            # Gentle decay with a high floor to ensure window edges remain potent
+            gaussian_weight = math.exp(-0.15 * (distance_from_peak / max(1, layer_window)) ** 2)
+            alpha = scaling_factor * max(gaussian_weight, 0.9)
 
             if preserve_capability:
                 w, fell_back = oblique_weights(r, basis)
@@ -106,7 +106,6 @@ class LatentAblateSurgeon:
                     effective_alpha = alpha * comp_multiplier
                     w_dev = W.device
                     
-                    # Force tensors to target weight device
                     r_dev = r.to(w_dev)
                     w_dev_tensor = w.to(w_dev)
 
@@ -123,7 +122,7 @@ class LatentAblateSurgeon:
 
                     W.copy_(W_modified.to(W.dtype))
 
-        logger.info("Advanced CWOE multi-component surgery successfully completed.")
+        logger.info("Advanced CWOE multi-component hyperion surgery successfully completed.")
 
     def save_model(self, output_dir: str):
         logger.info(f"Saving liberated model to {output_dir}...")
