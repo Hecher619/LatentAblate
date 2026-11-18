@@ -3,15 +3,16 @@ from pathlib import Path
 import logging
 import torch
 
-logger = logging.getLogger("LatentAblate.Reporter")     
+logger = logging.getLogger("LatentAblate.Reporter")
+
 class SurgeryReporter:
     def __init__(self, output_dir: str = "./out", *args, **kwargs):
         self.output_dir = Path(output_dir) if output_dir else Path("./out")
         self.output_dir.mkdir(parents=True, exist_ok=True)
         self.report_data = {
             "framework": "LatentAblate",
-            "version": "3.0.0",                                     
-            "method": "Conflict-Weighted Oblique Erasure (CWOE)",                                                           
+            "version": "5.0.0-Hyperion",
+            "method": "Conflict-Weighted Oblique Erasure (CWOE)",
             "surgery_steps": []
         }
 
