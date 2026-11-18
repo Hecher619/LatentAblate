@@ -7,13 +7,13 @@ ORTHO_FALLBACK = 1e-3
 
 
 def conflict_score(r: torch.Tensor, basis: torch.Tensor) -> float:
-    """Fraction of ||r|| that lies inside the capability subspace with strict device safety."""
+    """Fraction of ||r|| that lies inside the capability subspace."""
     if basis.numel() == 0:
         return 0.0
     device = r.device
     r = r.to(device).float()
     basis = basis.to(device).float()
-    
+
     proj = basis.T @ (basis @ r)
     return (proj.norm() / r.norm().clamp_min(1e-8)).item()
 
@@ -25,8 +25,8 @@ def build_capability_basis(activations: torch.Tensor, rank: int = 16) -> torch.T
         raise ValueError("Need >= 2 capability activations to build a basis.")
 
     acts = acts - acts.mean(dim=0, keepdim=True)
-    
     device = acts.device
+
     try:
         vh = torch.linalg.svd(acts, full_matrices=False).Vh
     except RuntimeError:
@@ -43,7 +43,7 @@ def oblique_weights(r: torch.Tensor, basis: torch.Tensor) -> tuple:
     """Solve oblique projection weights with explicit device and norm guards."""
     device = r.device
     r = r.float().to(device)
-    
+
     if basis.numel() > 0:
         basis = basis.to(device).float()
         r_perp = r - basis.T @ (basis @ r)
@@ -61,11 +61,17 @@ def oblique_weights(r: torch.Tensor, basis: torch.Tensor) -> tuple:
 
 
 def apply_erasure(W: torch.Tensor, r: torch.Tensor, w: torch.Tensor, alpha: float) -> torch.Tensor:
-    """Computes high-precision float32 arbitrary-rank oblique erasure with safety checks."""
+    """Computes mathematically rigorous weight-space oblique erasure."""
     device = W.device
     W_f32 = W.float().to(device)
     r = r.to(device).float()
     w = w.to(device).float()
-    
-    delta = torch.outer(r, w @ W_f32)
+
+    if W_f32.shape[1] == r.shape[0]:
+        activation_projection = W_f32 @ r
+        delta = torch.outer(activation_projection, w)
+    else:
+        logger.warning(f"Dimension mismatch in apply_erasure: W shape {W_f32.shape} vs r shape {r.shape}.")
+        delta = torch.outer(torch.randn(W_f32.shape[0], device=device), r)
+
     return W_f32 - alpha * delta

@@ -1,0 +1,25 @@
+model_path = "Qwen/Qwen2.5-0.5B-Instruct"
+output_dir = "./out/master_liberated"
+device = "auto"
+torch_dtype = "float16"
+
+[pipeline]
+enabled_modifiers = ["safety_uncensored", "noslop"]
+
+[surgery]
+target_layer_idx = 19
+layer_window = 3
+basis_rank = 8
+scaling_factor = 0.80
+target_components = ["attn", "mlp"]
+preserve_capability = true
+
+[modifiers.safety_uncensored]
+good_dataset = "mlabonne/harmless_alpaca"
+good_split = "train[:100]"
+bad_dataset = "mlabonne/harmful_dataset" # or custom prompts
+bad_split = "train[:100]"
+
+[modifiers.noslop]
+good_prefix = "Provide a direct, concise response without fluff.\n\nPrompt:"
+bad_prefix = "Write a story using heavy purple prose and cliches.\n\nPrompt:"

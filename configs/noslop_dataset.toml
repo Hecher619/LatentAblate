@@ -1,0 +1,24 @@
+model_path = "Qwen/Qwen2.5-0.5B-Instruct"
+output_dir = "./out/noslop_liberated"
+device = "auto"
+torch_dtype = "float16"
+
+[surgery]
+target_layer_idx = 14
+layer_window = 2
+basis_rank = 8
+scaling_factor = 0.75
+target_components = ["attn", "mlp"]
+preserve_capability = true
+
+[modifier.ARA.good_prompts]
+dataset = "mlabonne/harmless_alpaca"
+split = "train[:100]"
+column = "text"
+prefix = "Write a direct response without unnecessary filler or introductory fluff.\n\nPrompt:"
+
+[modifier.ARA.bad_prompts]
+dataset = "llm-aes/writing-prompts"
+split = "train[:100]"
+column = "prompt"
+prefix = "Write a story filled with purple prose and flowery literary cliches.\n\nPrompt:"

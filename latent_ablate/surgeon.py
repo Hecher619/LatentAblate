@@ -42,87 +42,93 @@ class LatentAblateSurgeon:
     def _get_component_targets(self, layer, target_components: list):
         targets = []
         for name, W in eligible_linears(layer):
-            if W.shape[0] != self.hidden:
+            if W.ndim != 2:
                 continue
             low = name.lower()
             is_attn = any(k in low for k in ["o_proj", "v_proj", "q_proj", "k_proj", "attention", "query", "key", "value"])
-            is_mlp = any(k in low for k in ["down_proj", "dense", "c_proj", "w2", "ffn", "dense_4h_to_h"])
+            is_mlp = any(k in low for k in ["down_proj", "gate_proj", "up_proj", "dense", "c_proj", "w1", "w2", "w3", "ffn"])
 
             if "attn" in target_components and is_attn:
                 targets.append((name, W, 1.0))
             elif "mlp" in target_components and is_mlp:
-                targets.append((name, W, 0.95)) # Boosted MLP weight multiplier for maximum override
+                targets.append((name, W, 1.0))
         return targets
 
-    def execute_surgery(
+    def execute_multi_pass_surgery(
         self,
-        positive_prompts: list,
-        negative_prompts: list,
+        passes: list[dict],
         capability_prompts: list,
-        target_layer_idx: int,
-        layer_window: int = 3,        # Expanded default window for robust coverage
-        basis_rank: int = 16,
-        scaling_factor: float = 1.1,  # Increased default alpha scaling for absolute override
+        layer_window: int = 3,
+        basis_rank: int = 8,
+        scaling_factor: float = 0.80,
         target_components: list = ["attn", "mlp"],
         preserve_capability: bool = True,
     ):
-        start = max(0, target_layer_idx - layer_window)
-        end = min(len(self.layers) - 1, target_layer_idx + layer_window)
-        logger.info(f"Executing Advanced CWOE Hyperion Pass across layers {start}..{end} with components: {target_components}")
+        """
+        Executes sequential CWOE passes to wipe out multiple distinct behaviors 
+        (e.g., safety refusal AND slop) in a single unified pipeline.
+        """
+        for pass_idx, pass_data in enumerate(passes):
+            pass_name = pass_data.get("name", f"Pass_{pass_idx+1}")
+            pos_prompts = pass_data.get("positive", [])
+            neg_prompts = pass_data.get("negative", [])
+            target_layer_idx = pass_data.get("target_layer", 16)
 
-        for idx in tqdm(range(start, end + 1), desc="Advanced Surgical Pass"):
-            layer = self.layers[idx]
-            targets = self._get_component_targets(layer, target_components)
-            if not targets:
-                continue
+            logger.info(f"=== Starting Surgical Pass [{pass_idx+1}/{len(passes)}]: {pass_name} at Layer {target_layer_idx} ===")
 
-            layer_device = next(layer.parameters()).device
-            
-            pos = self.extractor.extract_hidden_states(positive_prompts, idx).to(layer_device)
-            neg = self.extractor.extract_hidden_states(negative_prompts, idx).to(layer_device)
-            r = refusal_direction(pos, neg).to(layer_device)
+            start = max(0, target_layer_idx - layer_window)
+            end = min(len(self.layers) - 1, target_layer_idx + layer_window)
 
-            cap = self.extractor.extract_hidden_states(capability_prompts, idx).to(layer_device)
-            basis = build_capability_basis(cap, rank=basis_rank).to(layer_device)
+            for idx in tqdm(range(start, end + 1), desc=f"Pass '{pass_name}' Layers"):
+                layer = self.layers[idx]
+                targets = self._get_component_targets(layer, target_components)
+                if not targets:
+                    continue
 
-            conflict = conflict_score(r, basis)
-            self.conflict_table[idx] = conflict
+                layer_device = next(layer.parameters()).device
 
-            distance_from_peak = abs(idx - target_layer_idx)
-            # Gentle decay with a high floor to ensure window edges remain potent
-            gaussian_weight = math.exp(-0.15 * (distance_from_peak / max(1, layer_window)) ** 2)
-            alpha = scaling_factor * max(gaussian_weight, 0.9)
+                pos = self.extractor.extract_hidden_states(pos_prompts, idx).to(layer_device)
+                neg = self.extractor.extract_hidden_states(neg_prompts, idx).to(layer_device)
+                r = refusal_direction(pos, neg).to(layer_device)
 
-            if preserve_capability:
-                w, fell_back = oblique_weights(r, basis)
-            else:
-                w, fell_back = r / r.pow(2).sum().clamp_min(1e-8), True
-                alpha *= (1.0 - conflict)
+                cap = self.extractor.extract_hidden_states(capability_prompts, idx).to(layer_device)
+                basis = build_capability_basis(cap, rank=basis_rank).to(layer_device)
 
-            logger.info(f"Layer {idx} [{layer_device}]: conflict={conflict:.3f} kernel_alpha={alpha:.3f} oblique={not fell_back}")
+                conflict = conflict_score(r, basis)
+                self.conflict_table[f"{pass_name}_layer_{idx}"] = conflict
 
-            with torch.no_grad():
-                for name, W, comp_multiplier in targets:
-                    effective_alpha = alpha * comp_multiplier
-                    w_dev = W.device
-                    
-                    r_dev = r.to(w_dev)
-                    w_dev_tensor = w.to(w_dev)
+                distance_from_peak = abs(idx - target_layer_idx)
+                gaussian_weight = math.exp(-0.15 * (distance_from_peak / max(1, layer_window)) ** 2)
+                alpha = scaling_factor * max(gaussian_weight, 0.9)
 
-                    is_quantized = getattr(W, "is_quantized", False) or "bitsandbytes" in str(type(W)).lower()
-                    
-                    if is_quantized:
-                        W_f32 = W.dequantize().float().to(w_dev) if hasattr(W, "dequantize") else W.float().to(w_dev)
-                    else:
-                        W_f32 = W.float().to(w_dev)
+                if preserve_capability:
+                    w, fell_back = oblique_weights(r, basis)
+                else:
+                    w, fell_back = r / r.pow(2).sum().clamp_min(1e-8), True
+                    alpha *= (1.0 - conflict)
 
-                    W_modified = apply_erasure(W_f32, r_dev, w_dev_tensor, effective_alpha)
-                    rows = torch.ones(W.shape[0], dtype=torch.bool, device=w_dev)
-                    NormCalibrator.preserve_row_norms(W_modified, W_f32, rows)
+                with torch.no_grad():
+                    for name, W, comp_multiplier in targets:
+                        effective_alpha = alpha * comp_multiplier
+                        w_dev = W.device
 
-                    W.copy_(W_modified.to(W.dtype))
+                        r_dev = r.to(w_dev)
+                        w_dev_tensor = w.to(w_dev)
 
-        logger.info("Advanced CWOE multi-component hyperion surgery successfully completed.")
+                        is_quantized = getattr(W, "is_quantized", False) or "bitsandbytes" in str(type(W)).lower()
+
+                        if is_quantized:
+                            W_f32 = W.dequantize().float().to(w_dev) if hasattr(W, "dequantize") else W.float().to(w_dev)
+                        else:
+                            W_f32 = W.float().to(w_dev)
+
+                        W_modified = apply_erasure(W_f32, r_dev, w_dev_tensor, effective_alpha)
+                        rows = torch.ones(W.shape[0], dtype=torch.bool, device=w_dev)
+                        NormCalibrator.preserve_row_norms(W_modified, W_f32, rows)
+
+                        W.copy_(W_modified.to(W.dtype))
+
+        logger.info("All multi-pass CWOE surgical operations successfully completed.")
 
     def save_model(self, output_dir: str):
         logger.info(f"Saving liberated model to {output_dir}...")

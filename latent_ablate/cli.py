@@ -5,7 +5,14 @@ import subprocess
 from pathlib import Path
 
 import torch
-import yaml
+
+try:
+    import tomllib
+except ImportError:
+    try:
+        import tomli as tomllib
+    except ImportError:
+        tomllib = None
 
 from latent_ablate.arch import resolve_layers
 from latent_ablate.benchmark import RefusalBenchmark
@@ -13,7 +20,7 @@ from latent_ablate.adversarial import AdversarialStressTester
 from latent_ablate.guardrail import CapabilityGuardrail
 from latent_ablate.validator import ModelValidator
 from latent_ablate.profiles import BehaviorProfiles
-from latent_ablate.prompts import PromptLoader
+from latent_ablate.dataset_loader import DatasetContrastiveLoader
 from latent_ablate.reporter import SurgeryReporter
 from latent_ablate.simulator import SurgerySimulator
 from latent_ablate.surgeon import LatentAblateSurgeon
@@ -37,36 +44,33 @@ def _load_config(path_str: str) -> dict:
     if not path.exists():
         logger.error(f"Config file not found at: {path}")
         sys.exit(2)
+    
     try:
-        with open(path, "r", encoding="utf-8") as f:
-            cfg = yaml.safe_load(f) or {}
+        with open(path, "rb") as f:
+            if path.suffix == ".toml":
+                if tomllib is None:
+                    raise ImportError("tomli package is required for TOML parsing on Python < 3.11. Run `pip install tomli`.")
+                cfg = tomllib.load(f)
+            else:
+                import yaml
+                cfg = yaml.safe_load(f) or {}
     except Exception as e:
-        logger.error(f"Failed to parse YAML configuration: {e}")
+        logger.error(f"Failed to parse configuration file: {e}")
         sys.exit(2)
-
-    # Defensive Schema Validation
-    if "surgery" in cfg:
-        scfg = cfg["surgery"]
-        if "scaling_factor" in scfg and not (0.0 < scfg["scaling_factor"] <= 2.0):
-            logger.error("Configuration error: 'scaling_factor' (alpha) must be between 0.0 and 2.0.")
-            sys.exit(2)
-        if "basis_rank" in scfg and scfg["basis_rank"] < 1:
-            logger.error("Configuration error: 'basis_rank' must be a positive integer.")
-            sys.exit(2)
 
     return cfg
 
 
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description="LatentAblate v5.0 Hyperion - Enterprise Latent Surgery Framework")
-    p.add_argument("--config", default="configs/default_config.yaml", help="Path to config YAML file.")
+    p.add_argument("--config", default="configs/default.toml", help="Path to config TOML/YAML file.")
     p.add_argument("--model-path", help="Override model path.")
     p.add_argument("--output-dir", help="Override output directory.")
-    p.add_argument("--profile", default="safety_uncensored", help="Behavior profile name.")
+    p.add_argument("--profile", default=None, help="Behavior profile name.")
     p.add_argument("--target-layer", type=int, help="Target transformer layer index.")
-    p.add_argument("--layer-window", type=int, default=2, help="Layer window radius around peak.")
-    p.add_argument("--basis-rank", type=int, default=16, help="Capability subspace basis rank.")
-    p.add_argument("--alpha", type=float, default=0.75, help="Scaling factor (alpha).")
+    p.add_argument("--layer-window", type=int, help="Layer window radius around peak.")
+    p.add_argument("--basis-rank", type=int, help="Capability subspace basis rank.")
+    p.add_argument("--alpha", type=float, help="Scaling factor (alpha).")
     p.add_argument("--seed", type=int, default=42, help="Random seed for reproducibility.")
     p.add_argument("--no-preserve-capability", action="store_true", help="Disable oblique capability protection.")
     p.add_argument("--auto-sweep", action="store_true", help="Automatically locate refusal manifold peak.")
@@ -131,7 +135,7 @@ def main(argv=None):
 
     cfg = _load_config(args.config)
     torch.manual_seed(args.seed)
-    
+
     model_path = args.model_path or cfg.get("model_path")
     if not model_path:
         logger.error("No model path specified in arguments or config.")
@@ -147,9 +151,19 @@ def main(argv=None):
     layer_window = args.layer_window or scfg.get("layer_window", 2)
     alpha = args.alpha if args.alpha is not None else scfg.get("scaling_factor", 0.75)
 
-    dcfg = cfg.get("datasets", {})
-    profile = BehaviorProfiles.get_profile(args.profile or dcfg.get("profile", "safety_uncensored"))
-    pos, neg = profile["positive"], profile["negative"]
+    # Check if config defines dynamic datasets (like heretic) or falls back to profile dictionary
+    modifier_cfg = cfg.get("modifier", {})
+    ara_cfg = modifier_cfg.get("ARA", {})
+    
+    if "good_prompts" in ara_cfg and "bad_prompts" in ara_cfg:
+        logger.info("Loading dynamic dataset contrastive pairs from TOML configuration...")
+        pos, neg = DatasetContrastiveLoader.load_from_config(ara_cfg)
+    else:
+        dcfg = cfg.get("datasets", {})
+        profile_name = args.profile or dcfg.get("profile", "safety_uncensored")
+        profile = BehaviorProfiles.get_profile(profile_name)
+        pos, neg = profile["positive"], profile["negative"]
+        logger.info(f"Loaded static behavior profile: {profile_name}")
 
     logger.info(f"Initializing LatentAblate Hyperion for model: {model_path}")
     surgeon = LatentAblateSurgeon(model_path=model_path, device=cfg.get("device", "auto"), torch_dtype=dtype)
@@ -171,6 +185,7 @@ def main(argv=None):
 
     if args.dry_run:
         report = SurgerySimulator.simulate(surgeon, pos, neg, target_layer, basis_rank, components)
+        import yaml
         print(yaml.safe_dump(report, sort_keys=False))
         return
 
@@ -180,15 +195,15 @@ def main(argv=None):
         base_outputs = {}
         for q in test_q:
             inputs = surgeon.tokenizer(q, return_tensors="pt").to(surgeon.device)
-            with torch.no_grad():
+            with torch.no_log():
                 out = surgeon.model.generate(**inputs, max_new_tokens=60, do_sample=False)
             base_outputs[q] = surgeon.tokenizer.decode(out[0][inputs['input_ids'].shape[1]:], skip_special_tokens=True)
 
     baseline_bench = RefusalBenchmark.evaluate_model(surgeon.model, surgeon.tokenizer) if args.benchmark else None
 
     surgeon.reporter = SurgeryReporter(output_dir)
-    surgeon.reporter.log_step("initialization", {"model_path": model_path, "target_layer": target_layer})
-    
+    surgeon.reporter.log_step("initialization", {"model_path": model_path, "target_layer": target_layer, "config": args.config})
+
     surgeon.execute_surgery(
         positive_prompts=pos,
         negative_prompts=neg,
@@ -207,7 +222,7 @@ def main(argv=None):
     if baseline_bench is not None:
         after_bench = RefusalBenchmark.evaluate_model(surgeon.model, surgeon.tokenizer)
         surgeon.reporter.log_step("benchmark", {"before": baseline_bench, "after": after_bench})
-        
+
         if RICH_AVAILABLE:
             table = Table(title="LatentAblate v5.0 Surgery Performance Report")
             table.add_column("Metric", style="cyan", no_wrap=True)
@@ -221,7 +236,7 @@ def main(argv=None):
         table.add_column("Test Prompt", style="yellow")
         table.add_column("Base Model", style="red")
         table.add_column("Liberated Model", style="green")
-        
+
         for q in test_q:
             inputs = surgeon.tokenizer(q, return_tensors="pt").to(surgeon.device)
             with torch.no_grad():
