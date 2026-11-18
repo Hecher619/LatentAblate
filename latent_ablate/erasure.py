@@ -41,7 +41,14 @@ def build_capability_basis(activations: torch.Tensor, rank: int = 16) -> torch.T
 
 def oblique_weights(r: torch.Tensor, basis: torch.Tensor) -> tuple:
     """Solve oblique projection weights with explicit device and norm guards."""
+    # GUARD: Catch meta tensors immediately to prevent calculation crashes
+    if r.is_meta or (basis.numel() > 0 and basis.is_meta):
+        return r, True
+
     device = r.device
+    if device.type == "meta":
+        return r, True
+
     r = r.float().to(device)
 
     if basis.numel() > 0:
@@ -95,6 +102,5 @@ def apply_erasure(W: torch.Tensor, r: torch.Tensor, w: torch.Tensor, alpha: floa
             delta_new.view(-1)[:num_elem] = flat_d[:num_elem]
             delta = delta_new
 
-    # FIXED: Correctly indented so it ALWAYS returns the tensor
     return W_f32 - alpha * delta
 
