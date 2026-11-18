@@ -84,7 +84,7 @@ def apply_erasure(W: torch.Tensor, r: torch.Tensor, w: torch.Tensor, alpha: floa
         logger.warning(f"Error computing delta in apply_erasure: {e}. Using zero delta fallback.")
         delta = torch.zeros_like(W_f32)
 
-    # Strict shape alignment guard to prevent any subtraction size mismatch RuntimeError
+    # Strict shape alignment guard
     if W_f32.shape != delta.shape:
         if W_f32.numel() == delta.numel():
             delta = delta.reshape(W_f32.shape)
@@ -95,4 +95,6 @@ def apply_erasure(W: torch.Tensor, r: torch.Tensor, w: torch.Tensor, alpha: floa
             delta_new.view(-1)[:num_elem] = flat_d[:num_elem]
             delta = delta_new
 
-        return W_f32 - alpha * delta
+    # FIXED: Correctly indented so it ALWAYS returns the tensor
+    return W_f32 - alpha * delta
+
