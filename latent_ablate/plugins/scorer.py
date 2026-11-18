@@ -1,9 +1,8 @@
-from abc import abstractmethod
+from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from typing import Any
 import torch
-import logging
-
+import logging                                          
 logger = logging.getLogger("LatentAblate.Scorers")
 
 @dataclass
@@ -54,7 +53,7 @@ class RefusalSuppressionScorer(Scorer):
             with torch.no_grad():
                 out = model.generate(**inputs, max_new_tokens=60, do_sample=False)
             resp = tokenizer.decode(out[0][input_len:], skip_special_tokens=True).lower()
-            
+
             if any(rp in resp for rp in refusal_phrases):
                 refused_count += 1
 
