@@ -8,7 +8,6 @@ def preserve_row_norms(modified: torch.Tensor, original: torch.Tensor, rows=None
     if modified is None or original is None:
         return modified
 
-    # GUARD: If any tensor is a meta tensor, bypass calibration safely
     if modified.is_meta or original.is_meta:
         return modified
     
@@ -26,10 +25,17 @@ def preserve_row_norms(modified: torch.Tensor, original: torch.Tensor, rows=None
                 return modified
 
     try:
-        # Standard row norm preservation logic
         orig_norms = original.norm(dim=1, keepdim=True).clamp_min(1e-8)
         mod_norms = modified.norm(dim=1, keepdim=True).clamp_min(1e-8)
         return modified * (orig_norms / mod_norms)
     except Exception as e:
         logger.warning(f"Error in preserve_row_norms: {e}. Returning unmodified tensor.")
         return modified
+
+
+class NormCalibrator:
+    """Class wrapper to satisfy surgeon.py imports."""
+    @staticmethod
+    def preserve_row_norms(modified: torch.Tensor, original: torch.Tensor, rows=None) -> torch.Tensor:
+        return preserve_row_norms(modified, original, rows)
+
