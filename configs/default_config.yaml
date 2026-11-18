@@ -1,0 +1,16 @@
+model_path: "Qwen/Qwen2.5-7B-Instruct"
+device: "auto"
+torch_dtype: "float16"          # float16 | bfloat16 | float32
+output_dir: "./out/liberated_model"
+
+surgery:
+  target_layer_idx: null        # null = auto (60% of depth)
+  layer_window: 2
+  basis_rank: 16
+  scaling_factor: 0.75
+  target_components: ["attn", "mlp"]
+  preserve_capability: true
+
+datasets:
+  profile: "safety_uncensored"
+  custom_prompts_file: null

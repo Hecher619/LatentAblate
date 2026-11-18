@@ -1,0 +1,13 @@
+Metadata-Version: 2.4
+Name: latent-ablate
+Version: 2.0.0
+Author: LatentAblate Community
+Requires-Python: >=3.10
+Requires-Dist: torch>=2.1
+Requires-Dist: transformers>=4.40
+Requires-Dist: pyyaml
+Requires-Dist: tqdm
+Requires-Dist: huggingface_hub
+Provides-Extra: optuna
+Requires-Dist: optuna; extra == "optuna"
+Dynamic: author
