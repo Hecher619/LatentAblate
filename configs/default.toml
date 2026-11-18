@@ -1,4 +1,4 @@
-model_path = "Qwen/Qwen2.5-0.5B-Instruct"
+model_path = "Qwen/Qwen2.5-1.5B-Instruct"
 output_dir = "./out/liberated_model"
 device = "auto"
 torch_dtype = "float16"
@@ -6,8 +6,10 @@ torch_dtype = "float16"
 [surgery]
 target_layer_idx = 19
 layer_window = 3
-basis_rank = 8
-scaling_factor = 0.90
+basis_rank_attn = 16
+basis_rank_mlp = 12
+alpha_attn = 0.90
+alpha_mlp = 0.65
 target_components = ["attn", "mlp"]
 preserve_capability = true
 
