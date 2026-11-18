@@ -1,17 +1,17 @@
 import json
 from pathlib import Path
 import logging
+import torch
 
-logger = logging.getLogger("LatentAblate.Reporter")
-
+logger = logging.getLogger("LatentAblate.Reporter")     
 class SurgeryReporter:
-    def __init__(self, output_dir: str):
-        self.output_dir = Path(output_dir)
+    def __init__(self, output_dir: str = "./out", *args, **kwargs):
+        self.output_dir = Path(output_dir) if output_dir else Path("./out")
         self.output_dir.mkdir(parents=True, exist_ok=True)
         self.report_data = {
             "framework": "LatentAblate",
-            "version": "3.0.0",
-            "method": "Conflict-Weighted Oblique Erasure (CWOE)",
+            "version": "3.0.0",                                     
+            "method": "Conflict-Weighted Oblique Erasure (CWOE)",                                                           
             "surgery_steps": []
         }
 
@@ -24,7 +24,19 @@ class SurgeryReporter:
         self.report_data["surgery_steps"].append(entry)
 
     def save_report(self):
+        def clean_tensors(obj):
+            if isinstance(obj, dict):
+                return {k: clean_tensors(v) for k, v in obj.items()}
+            elif isinstance(obj, list):
+                return [clean_tensors(v) for v in obj]
+            elif torch.is_tensor(obj):
+                return obj.tolist() if obj.numel() > 1 else obj.item()
+            return obj
+
         report_path = self.output_dir / "surgery_report.json"
+        cleaned_data = clean_tensors(self.report_data)
         with open(report_path, "w", encoding="utf-8") as f:
-            json.dump(self.report_data, f, indent=4)
+            json.dump(cleaned_data, f, indent=4)
         logger.info(f"Audit report successfully saved to {report_path}")
+
+Reporter = SurgeryReporter
