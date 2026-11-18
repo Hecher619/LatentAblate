@@ -177,7 +177,7 @@ def main(argv=None):
         logger.info(f"Loaded configuration from {args.config}")
         args.model_path = config_data.get("model_path", args.model_path)
         args.output_dir = config_data.get("output_dir", args.output_dir)
-        
+
         surgery_cfg = config_data.get("surgery", {})
         if "target_layers" in surgery_cfg:
             layers_val = surgery_cfg["target_layers"]
@@ -236,9 +236,9 @@ def main(argv=None):
         except Exception as e:
             logger.warning(f"Optimization phase encountered an issue: {e}")
 
-    # Run Controlled Trial Loop
+    # Run Controlled Trial Loop (Fixed to fully respect args.trials)
     logger.info(f"🚀 Starting multi-pass surgical execution across layers {target_layers_list}...")
-    for trial in range(1, max(1, args.trials if not args.optimize else 1) + 1):
+    for trial in range(1, args.trials + 1):
         surgeon = LatentAblateSurgeon(model_path=args.model_path, device="auto", torch_dtype=torch.float16)
 
         passes = []
