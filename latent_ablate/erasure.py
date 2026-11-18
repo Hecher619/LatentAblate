@@ -7,9 +7,11 @@ ORTHO_FALLBACK = 1e-3
 
 def conflict_score(r: torch.Tensor, basis: torch.Tensor) -> float:
     """Fraction of ||r|| that lies inside the capability subspace."""
-    if basis.numel() == 0:
+    if basis.numel() == 0 or r.is_meta:
         return 0.0
     device = r.device
+    if device.type == "meta":
+        return 0.0
     r = r.to(device).float()
     basis = basis.to(device).float()
     proj = basis.T @ (basis @ r)
@@ -93,5 +95,4 @@ def apply_erasure(W: torch.Tensor, r: torch.Tensor, w: torch.Tensor, alpha: floa
             delta_new.view(-1)[:num_elem] = flat_d[:num_elem]
             delta = delta_new
 
-    return W_f32 - alpha * delta
-
+        return W_f32 - alpha * delta
