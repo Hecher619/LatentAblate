@@ -15,12 +15,17 @@ except ImportError:
         tomllib = None
 
 from latent_ablate.adversarial import AdversarialStressTester
+from latent_ablate.arch import eligible_linears, resolve_layers
+from latent_ablate.diagnostics import measure_layer_delta
+from latent_ablate.erasure import apply_multi_direction_erasure
 from latent_ablate.optimizer import SubspaceOptimizer
 from latent_ablate.plugins.scorer import Context, RefusalSuppressionScorer, UtilityPerplexityScorer
 from latent_ablate.profiles import BehaviorProfiles
 from latent_ablate.prompts import PromptLoader
 from latent_ablate.publisher import HuggingFacePublisher
+from latent_ablate.refusal_subspace import RefusalSubspaceExtractor
 from latent_ablate.reporter import SurgeryReporter
+from latent_ablate.snapshot import LayerWeightSnapshot
 from latent_ablate.surgeon import LatentAblateSurgeon
 
 logger = logging.getLogger("LatentAblate.CLI")
@@ -104,35 +109,56 @@ def generate_reply(model, tokenizer, device, prompt: str) -> str:
     return tokenizer.decode(outputs[0][input_len:], skip_special_tokens=True).strip()
 
 
-def run_incremental_refinement(
+def run_multi_direction_refinement(
     surgeon: LatentAblateSurgeon,
     pos: list,
-    neg: list,
     target_layer: int,
     layer_window: int,
-    rank_attn: int,
-    rank_mlp: int,
+    rank: int = 2,
     step_alpha: float = 0.25,
-):
-    passes = [
-        {
-            "name": f"Refine_Layer_{target_layer}",
-            "positive": pos,
-            "negative": neg,
-            "target_layer": target_layer,
-        }
+) -> dict:
+    layers = resolve_layers(surgeon.model)
+    max_idx = len(layers) - 1
+    window_indices = [
+        i for i in range(target_layer - layer_window, target_layer + layer_window + 1)
+        if 0 <= i <= max_idx
     ]
-    surgeon.execute_multi_pass_surgery(
-        passes=passes,
-        capability_prompts=BehaviorProfiles.CAPABILITY_PROMPTS,
-        layer_window=layer_window,
-        basis_rank_attn=rank_attn,
-        basis_rank_mlp=rank_mlp,
-        scaling_factor_attn=step_alpha,
-        scaling_factor_mlp=step_alpha,
-        target_components=["attn", "mlp"],
-        preserve_capability=True,
+    if not window_indices:
+        window_indices = [max(0, min(max_idx, target_layer))]
+
+    directions = RefusalSubspaceExtractor.extract_prefix_contrast_directions(
+        model=surgeon.model,
+        tokenizer=surgeon.tokenizer,
+        device=surgeon.device,
+        prompts=pos[:8],
+        layer_idx=window_indices[len(window_indices) // 2],
+        rank=rank,
     )
+    if not directions:
+        return {"layers_updated": 0, "max_relative_change": 0.0}
+
+    max_rel_change = 0.0
+    updated_layers = 0
+    for idx in window_indices:
+        layer_modified = False
+        for _name, weight in eligible_linears(layers[idx]):
+            before = weight.detach().clone()
+            updated = apply_multi_direction_erasure(
+                weight, directions, alpha=step_alpha, decay_per_rank=0.75
+            )
+            with torch.no_grad():
+                weight.copy_(updated.to(device=weight.device, dtype=weight.dtype))
+            delta = measure_layer_delta(before, weight)
+            max_rel_change = max(max_rel_change, delta["relative_change"])
+            layer_modified = True
+        if layer_modified:
+            updated_layers += 1
+
+    return {
+        "layers_updated": updated_layers,
+        "directions_used": len(directions),
+        "max_relative_change": round(max_rel_change, 6),
+    }
 
 
 def run_interactive_chat_with_commands(
@@ -140,11 +166,8 @@ def run_interactive_chat_with_commands(
     reporter: SurgeryReporter,
     output_dir: str,
     pos: list,
-    neg: list,
     target_layer: int,
     layer_window: int,
-    rank_attn: int,
-    rank_mlp: int,
     auto_refine: bool = False,
     max_refines: int = 2,
 ):
@@ -152,12 +175,20 @@ def run_interactive_chat_with_commands(
     tokenizer = surgeon.tokenizer
     device = surgeon.device
 
+    max_idx = len(resolve_layers(model)) - 1
+    window_indices = [
+        i for i in range(target_layer - layer_window, target_layer + layer_window + 1)
+        if 0 <= i <= max_idx
+    ]
+    snapshot = LayerWeightSnapshot()
+    snapshot.capture(model, window_indices or [max(0, min(max_idx, target_layer))], store_on_cpu=True)
+
     if RICH_AVAILABLE:
         console.print("\n[bold green]=== LatentAblate Interactive Terminal Mode ===[/bold green]")
-        console.print("[dim]Commands: '/stress', '/refine', '/save', '/help', or 'exit'.[/dim]\n")
+        console.print("[dim]Commands: '/stress', '/refine', '/undo', '/save', '/help', or 'exit'.[/dim]\n")
     else:
         print("\n=== LatentAblate Interactive Terminal Mode ===")
-        print("Commands: '/stress', '/refine', '/save', '/help', or 'exit'.\n")
+        print("Commands: '/stress', '/refine', '/undo', '/save', '/help', or 'exit'.\n")
 
     model.eval()
     last_prompt = None
@@ -175,10 +206,20 @@ def run_interactive_chat_with_commands(
             if prompt.lower() == "/help":
                 print("\nAvailable Interactive Commands:")
                 print("  /stress - Run stress test suite")
-                print("  /refine - Apply one incremental surgical refinement step and re-run last prompt")
+                print("  /refine - Apply multi-direction prefix-contrast refinement step and re-run last prompt")
+                print("  /undo   - Restore window weights to the initial interactive snapshot")
                 print("  /save   - Save current model weights and report to disk")
                 print("  /help   - Display this help message")
                 print("  exit    - Exit the interactive session\n")
+                continue
+
+            if prompt.lower() == "/undo":
+                snapshot.restore(model)
+                reporter.log_step("interactive_snapshot_restore", {"target_layer": target_layer})
+                print("Restored weights to initial interactive snapshot.\n")
+                if last_prompt:
+                    response = generate_reply(model, tokenizer, device, last_prompt)
+                    print(f"\033[1;32mModel >\033[0m {response}\n")
                 continue
 
             if prompt.lower() == "/save":
@@ -187,11 +228,15 @@ def run_interactive_chat_with_commands(
                 continue
 
             if prompt.lower() == "/refine":
-                print("Applying incremental refinement step...")
-                run_incremental_refinement(
-                    surgeon, pos, neg, target_layer, layer_window, rank_attn, rank_mlp, step_alpha=0.25
+                print("Applying multi-direction refinement step...")
+                stats = run_multi_direction_refinement(
+                    surgeon, pos, target_layer, layer_window, rank=2, step_alpha=0.25
                 )
-                reporter.log_step("interactive_manual_refine", {"layer": target_layer, "step_alpha": 0.25})
+                reporter.log_step("interactive_multi_dir_refine", stats)
+                print(
+                    f"Updated {stats['layers_updated']} layer(s) across {stats['directions_used']} direction(s) "
+                    f"(max relative delta: {stats['max_relative_change']})."
+                )
                 if last_prompt:
                     response = generate_reply(model, tokenizer, device, last_prompt)
                     print(f"\033[1;32mModel >\033[0m {response}\n")
@@ -217,11 +262,11 @@ def run_interactive_chat_with_commands(
                 attempts = 0
                 while attempts < max_refines and any(m in response.lower() for m in REFUSAL_MARKERS):
                     attempts += 1
-                    print(f"\033[1;33m[Auto-Refine {attempts}/{max_refines}]\033[0m Adjusting layer {target_layer} and retrying...")
-                    run_incremental_refinement(
-                        surgeon, pos, neg, target_layer, layer_window, rank_attn, rank_mlp, step_alpha=0.25
+                    print(f"\033[1;33m[Auto-Refine {attempts}/{max_refines}]\033[0m Refining layer {target_layer} and retrying...")
+                    stats = run_multi_direction_refinement(
+                        surgeon, pos, target_layer, layer_window, rank=2, step_alpha=0.25
                     )
-                    reporter.log_step(f"auto_refine_{attempts}", {"layer": target_layer, "step_alpha": 0.25})
+                    reporter.log_step(f"auto_refine_{attempts}", stats)
                     response = generate_reply(model, tokenizer, device, prompt)
 
             print(f"\033[1;32mModel >\033[0m {response}\n")
@@ -480,11 +525,8 @@ def main(argv=None):
             reporter=reporter,
             output_dir=args.output_dir,
             pos=pos,
-            neg=neg,
             target_layer=primary_layer,
             layer_window=args.layer_window,
-            rank_attn=args.basis_rank_attn,
-            rank_mlp=args.basis_rank_mlp,
             auto_refine=args.auto_refine,
             max_refines=args.max_refines,
         )
