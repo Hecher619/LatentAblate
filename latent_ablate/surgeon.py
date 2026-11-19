@@ -95,6 +95,38 @@ class LatentAblateSurgeon:
                 targets.append((name, W, "mlp"))
         return targets
 
+    def execute_surgery(
+        self,
+        positive_prompts: list,
+        negative_prompts: list,
+        capability_prompts: list,
+        target_layer_idx: int = 18,
+        layer_window: int = 3,
+        basis_rank: int = 16,
+        scaling_factor: float = 1.15,
+        target_components: list = None,
+        preserve_capability: bool = True,
+    ):
+        passes = [
+            {
+                "name": f"Layer_{target_layer_idx}_Pass",
+                "positive": positive_prompts,
+                "negative": negative_prompts,
+                "target_layer": target_layer_idx,
+            }
+        ]
+        return self.execute_multi_pass_surgery(
+            passes=passes,
+            capability_prompts=capability_prompts,
+            layer_window=layer_window,
+            basis_rank_attn=basis_rank,
+            basis_rank_mlp=max(4, basis_rank // 2),
+            scaling_factor_attn=scaling_factor,
+            scaling_factor_mlp=scaling_factor,
+            target_components=target_components,
+            preserve_capability=preserve_capability,
+        )
+
     def execute_multi_pass_surgery(
         self,
         passes: list[dict],
