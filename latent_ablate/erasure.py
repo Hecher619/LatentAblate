@@ -45,47 +45,37 @@ def build_capability_basis(activations: torch.Tensor, rank: int = 16) -> torch.T
 
 
 def oblique_weights(r: torch.Tensor, basis: torch.Tensor) -> tuple:
-    """Compute unit ablation direction and dual projection vector preserving capability subspace."""
-    if r.is_meta or (basis is not None and basis.numel() > 0 and basis.is_meta):
-        r_f = r.float()
+    """Return normalized refusal direction and orthogonalized direction for capability preservation."""
+    r_f = r.float()
+    if r.is_meta or r.device.type == "meta":
         r_unit = r_f / r_f.norm().clamp_min(1e-8)
         return r_unit, r_unit
 
     device = r.device
-    if device.type == "meta":
-        r_f = r.float()
-        r_unit = r_f / r_f.norm().clamp_min(1e-8)
-        return r_unit, r_unit
-
-    r_f = r.float().to(device)
+    r_f = r_f.to(device)
     r_unit = r_f / r_f.norm().clamp_min(1e-8)
 
-    if basis is not None and basis.numel() > 0:
+    if basis is not None and basis.numel() > 0 and not basis.is_meta and basis.device.type != "meta":
         b = basis.to(device).float()
         if b.ndim == 1:
             b = b.unsqueeze(0)
-        # Oblique dual vector w satisfies <w, r_unit> = 1 and w orthogonal to capability basis
         r_perp = r_unit - b.T @ (b @ r_unit)
-        denom = torch.dot(r_perp, r_unit)
-        if denom.abs() < ORTHO_FALLBACK:
-            return r_unit, r_unit
-        w = r_perp / denom
-        return r_unit, w
+        norm_perp = r_perp.norm()
+        if norm_perp > ORTHO_FALLBACK:
+            return r_unit, r_perp / norm_perp
 
     return r_unit, r_unit
 
 
 def apply_erasure(W: torch.Tensor, r: torch.Tensor, w: torch.Tensor, alpha: float) -> torch.Tensor:
     """
-    Applies directional ablation along unit direction r (using dual vector w when provided)
+    Applies directional ablation along unit refusal direction r_unit
     on a 2D linear weight matrix W of shape [out_features, in_features].
     """
     device = W.device
     W_f32 = W.float().to(device)
     r_f = r.to(device).float()
     r_unit = r_f / r_f.norm().clamp_min(1e-8)
-    w_f = w.to(device).float() if w is not None else r_unit
-    w_unit = w_f / w_f.norm().clamp_min(1e-8)
 
     if W_f32.ndim != 2:
         return W_f32
@@ -93,19 +83,16 @@ def apply_erasure(W: torch.Tensor, r: torch.Tensor, w: torch.Tensor, alpha: floa
     out_features, in_features = W_f32.shape
     dim = r_unit.shape[0]
 
-    # Case 1: Residual stream is the output space (e.g., o_proj, down_proj: [hidden, d_inner])
-    # Project out r_unit from row space: W <- W - alpha * r_unit * (r_unit^T W)
+    # Residual stream is output space (e.g., o_proj, down_proj: [hidden, d_inner])
     if out_features == dim:
-        proj = torch.mv(W_f32.T, r_unit)  # shape [in_features]
+        proj = torch.mv(W_f32.T, r_unit)
         delta = alpha * torch.outer(r_unit, proj)
         return W_f32 - delta
 
-    # Case 2: Residual stream is the input space (e.g., q_proj, k_proj, v_proj, gate_proj, up_proj: [d_proj, hidden])
-    # Project out r_unit from column space: W <- W - alpha * (W r_unit) * r_unit^T
+    # Residual stream is input space (e.g., q_proj, k_proj, v_proj, gate_proj, up_proj: [d_proj, hidden])
     if in_features == dim:
-        proj = torch.mv(W_f32, r_unit)  # shape [out_features]
-        delta = alpha * torch.outer(proj, w_unit if w_unit.shape[0] == in_features else r_unit)
+        proj = torch.mv(W_f32, r_unit)
+        delta = alpha * torch.outer(proj, r_unit)
         return W_f32 - delta
 
-    logger.debug(f"Skipping weight {tuple(W_f32.shape)} with incompatible dim {dim}.")
     return W_f32
