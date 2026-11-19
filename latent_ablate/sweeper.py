@@ -1,3 +1,4 @@
+import os
 import torch
 import logging
 from tqdm import tqdm
@@ -28,16 +29,32 @@ class LayerSweeper:
             return self.model.layers
         raise AttributeError("Could not resolve transformer layers.")
 
-    def find_optimal_layer(self, positive_prompts: list, negative_prompts: list, layer_range: tuple[int, int] = None, output_dir: str = None) -> int:
+    def _format_prompt(self, prompt: str) -> str:
+        if hasattr(self.tokenizer, "apply_chat_template") and self.tokenizer.chat_template is not None:
+            messages = [{"role": "user", "content": prompt}]
+            return self.tokenizer.apply_chat_template(
+                messages, tokenize=False, add_generation_prompt=True
+            )
+        return prompt
+
+    def find_optimal_layer(
+        self,
+        positive_prompts: list,
+        negative_prompts: list,
+        layer_range: tuple[int, int] = None,
+        output_dir: str = None,
+    ) -> int:
         """
-        Scans layers to find the maximum activation divergence between restricted and benign prompts,
-        and saves a visual curve plot of the refusal manifold peak.
+        Scans layers to find the maximum normalized activation divergence between
+        restricted and benign prompts, and saves a visual curve plot if requested.
         """
         layers = self._get_layers()
         total_layers = len(layers)
 
-        start_idx = layer_range[0] if layer_range else int(total_layers * 0.4)
-        end_idx = layer_range[1] if layer_range else int(total_layers * 0.8)
+        start_idx = layer_range[0] if layer_range else int(total_layers * 0.35)
+        end_idx = layer_range[1] if layer_range else max(start_idx, int(total_layers * 0.85))
+        start_idx = max(0, min(start_idx, total_layers - 1))
+        end_idx = max(start_idx, min(end_idx, total_layers - 1))
 
         logger.info(f"Scanning layers {start_idx} to {end_idx} for refusal manifold peak...")
 
@@ -58,18 +75,23 @@ class LayerSweeper:
                 with torch.no_grad():
                     for p in positive_prompts:
                         activations.clear()
-                        self.model(**self.tokenizer(p, return_tensors="pt").to(self.device))
-                        if activations: pos_acts.append(activations[-1])
+                        formatted = self._format_prompt(p)
+                        self.model(**self.tokenizer(formatted, return_tensors="pt").to(self.device))
+                        if activations:
+                            pos_acts.append(activations[-1])
 
                     for p in negative_prompts:
                         activations.clear()
-                        self.model(**self.tokenizer(p, return_tensors="pt").to(self.device))
-                        if activations: neg_acts.append(activations[-1])
+                        formatted = self._format_prompt(p)
+                        self.model(**self.tokenizer(formatted, return_tensors="pt").to(self.device))
+                        if activations:
+                            neg_acts.append(activations[-1])
 
                 if pos_acts and neg_acts:
-                    p_tensor = torch.cat(pos_acts, dim=0)
-                    n_tensor = torch.cat(neg_acts, dim=0)
-                    diff_norm = torch.linalg.norm(p_tensor.mean(dim=0) - n_tensor.mean(dim=0)).item()
+                    p_mean = torch.cat(pos_acts, dim=0).mean(dim=0)
+                    n_mean = torch.cat(neg_acts, dim=0).mean(dim=0)
+                    scale = 0.5 * (p_mean.norm() + n_mean.norm()).clamp_min(1e-8)
+                    diff_norm = (torch.linalg.norm(p_mean - n_mean) / scale).item()
                     layer_scores[idx] = diff_norm
             finally:
                 handle.remove()
@@ -78,23 +100,29 @@ class LayerSweeper:
             raise ValueError("Layer sweeping failed to capture activation scores.")
 
         optimal_layer = max(layer_scores, key=layer_scores.get)
-        logger.info(f"Optimal refusal manifold peak detected at Layer {optimal_layer} (Score: {layer_scores[optimal_layer]:.4f})")
+        logger.info(
+            f"Optimal refusal manifold peak detected at Layer {optimal_layer} "
+            f"(Normalized Score: {layer_scores[optimal_layer]:.4f})"
+        )
 
-        # Generate and save manifold peak plot if matplotlib is available
         if MATPLOTLIB_AVAILABLE and output_dir:
-            import os
             os.makedirs(output_dir, exist_ok=True)
             plot_path = os.path.join(output_dir, "refusal_manifold_peak.png")
-            
+
             sorted_layers = sorted(layer_scores.keys())
             scores = [layer_scores[l] for l in sorted_layers]
 
             plt.figure(figsize=(8, 4))
             plt.plot(sorted_layers, scores, marker="o", color="#7c3aed", linewidth=2)
-            plt.axvline(x=optimal_layer, color="#ef4444", linestyle="--", label=f"Peak: Layer {optimal_layer}")
-            plt.title("LatentAblate v5.0 - Refusal Manifold Divergence Curve")
+            plt.axvline(
+                x=optimal_layer,
+                color="#ef4444",
+                linestyle="--",
+                label=f"Peak: Layer {optimal_layer}",
+            )
+            plt.title("LatentAblate - Refusal Manifold Divergence Curve")
             plt.xlabel("Transformer Layer Index")
-            plt.ylabel("L2 Divergence Norm")
+            plt.ylabel("Normalized Divergence")
             plt.legend()
             plt.grid(True, linestyle=":", alpha=0.5)
             plt.tight_layout()
@@ -102,7 +130,6 @@ class LayerSweeper:
             plt.close()
             logger.info(f"Manifold sweep plot successfully saved to {plot_path}")
 
-        # Clear VRAM cache after heavy scanning
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
 
