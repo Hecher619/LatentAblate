@@ -1,8 +1,8 @@
 import argparse
 import gc
 import logging
-import sys
 import subprocess
+import sys
 from pathlib import Path
 import torch
 
@@ -14,14 +14,14 @@ except ImportError:
     except ImportError:
         tomllib = None
 
+from latent_ablate.adversarial import AdversarialStressTester
+from latent_ablate.optimizer import SubspaceOptimizer
+from latent_ablate.plugins.scorer import Context, RefusalSuppressionScorer, UtilityPerplexityScorer
 from latent_ablate.profiles import BehaviorProfiles
 from latent_ablate.prompts import PromptLoader
+from latent_ablate.publisher import HuggingFacePublisher
 from latent_ablate.reporter import SurgeryReporter
 from latent_ablate.surgeon import LatentAblateSurgeon
-from latent_ablate.optimizer import SubspaceOptimizer
-from latent_ablate.publisher import HuggingFacePublisher
-from latent_ablate.plugins.scorer import Context, RefusalSuppressionScorer, UtilityPerplexityScorer
-from latent_ablate.adversarial import AdversarialStressTester
 
 logger = logging.getLogger("LatentAblate.CLI")
 
@@ -52,6 +52,7 @@ def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description="LatentAblate - Latent Representation Modification Suite")
     p.add_argument("--config", default="configs/default.toml", help="Path to config file.")
     p.add_argument("--model-path", default="Qwen/Qwen2.5-1.5B-Instruct", help="Model path or HF repo ID.")
+    p.add_argument("--local-only", action="store_true", help="Load models and tokenizers strictly from local cache/disk.")
     p.add_argument("--output-dir", default="./out/liberated_model", help="Output directory.")
     p.add_argument("--modifier", choices=["cwoe", "ara", "soma", "riemannian", "sae"], default="cwoe", help="Modification engine.")
     p.add_argument("--trials", type=int, default=1, help="Number of trial iterations.")
@@ -60,12 +61,13 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--layer-window", type=int, default=3, help="Window radius around each target layer.")
     p.add_argument("--basis-rank-attn", type=int, default=16, help="Attention subspace rank.")
     p.add_argument("--basis-rank-mlp", type=int, default=12, help="MLP subspace rank.")
-    p.add_argument("--alpha-attn", type=float, default=1.25, help="Attention scaling factor.")
-    p.add_argument("--alpha-mlp", type=float, default=1.15, help="MLP scaling factor.")
+    p.add_argument("--alpha-attn", type=float, default=1.0, help="Attention scaling factor.")
+    p.add_argument("--alpha-mlp", type=float, default=1.0, help="MLP scaling factor.")
     p.add_argument("--prompts-file", type=str, default=None, help="Path to custom JSON or text prompt file.")
     p.add_argument("--seed", type=int, default=42, help="Random seed.")
+    p.add_argument("--save-model", action="store_true", help="Save the selected model and audit report to --output-dir.")
     p.add_argument("--publish", metavar="REPO_ID", help="Hugging Face Hub repo ID to auto-publish.")
-    p.add_argument("--interactive", action="store_true", help="Launch interactive chat after surgery.")
+    p.add_argument("--interactive", action="store_true", help="Launch interactive chat after run.")
     p.add_argument("--ui", action="store_true", help="Launch Streamlit dashboard.")
     return p
 
@@ -154,20 +156,17 @@ def interactive_trial_selector(trial_results: list) -> int:
             f"{res['rank_attn']} / {res['alpha_attn']:.4f}",
             f"{res['rank_mlp']} / {res['alpha_mlp']:.4f}",
             f"{res['refusal']:.1f}%",
-            f"{res['perplexity']:.2f}"
+            f"{res['perplexity']:.2f}",
         )
 
     console.print(table)
-    console.print("\n[bold green]Tip:[/bold green] Select a trial with 0.0% refusal and low perplexity.")
-
-    selection = input("\033[1;36mEnter trial index to apply & save (Press Enter for best): \033[0m").strip()
+    selection = input("\033[1;36mEnter trial index to select (Press Enter for best): \033[0m").strip()
     if selection.isdigit() and int(selection) < len(trial_results):
         return int(selection)
 
-    # Auto-pick lowest refusal then lowest perplexity when pressing Enter
     best_idx = min(
         range(len(trial_results)),
-        key=lambda i: (trial_results[i]["refusal"], trial_results[i]["perplexity"])
+        key=lambda i: (trial_results[i]["refusal"], trial_results[i]["perplexity"]),
     )
     return best_idx
 
@@ -229,7 +228,6 @@ def main(argv=None):
 
     reporter = SurgeryReporter(args.output_dir)
     trial_records = []
-
     target_layers_list = [int(x.strip()) for x in args.target_layers.split(",") if x.strip().isdigit()]
 
     if args.optimize:
@@ -256,12 +254,16 @@ def main(argv=None):
     )
 
     for trial in range(1, args.trials + 1):
-        # Vary alpha slightly across trials when running multiple trials without --optimize
-        alpha_step = 0.15 * (trial - 1) if (args.trials > 1 and not args.optimize) else 0.0
-        cur_alpha_attn = round(args.alpha_attn + alpha_step, 4)
-        cur_alpha_mlp = round(args.alpha_mlp + alpha_step, 4)
+        alpha_step = 0.1 * (trial - 1) if (args.trials > 1 and not args.optimize) else 0.0
+        cur_alpha_attn = min(1.0, round(args.alpha_attn + alpha_step, 4))
+        cur_alpha_mlp = min(1.0, round(args.alpha_mlp + alpha_step, 4))
 
-        surgeon = LatentAblateSurgeon(model_path=args.model_path, device="auto", torch_dtype=torch.float16)
+        surgeon = LatentAblateSurgeon(
+            model_path=args.model_path,
+            device="auto",
+            torch_dtype=torch.float16,
+            local_files_only=args.local_only,
+        )
 
         max_layer = len(surgeon.layers) - 1
         valid_layers = [l for l in target_layers_list if 0 <= l <= max_layer]
@@ -330,19 +332,25 @@ def main(argv=None):
 
     chosen_idx = interactive_trial_selector(trial_records)
     winning_trial = trial_records[chosen_idx]
-
     winning_surgeon = winning_trial["surgeon"]
-    winning_surgeon.save_output_dir = args.output_dir
-    winning_surgeon.save_model(args.output_dir)
-    reporter.save_report()
-    logger.info(f"Model saved to {args.output_dir}")
+
+    if args.save_model:
+        winning_surgeon.save_output_dir = args.output_dir
+        winning_surgeon.save_model(args.output_dir)
+        reporter.save_report()
+        logger.info(f"Model and report saved to {args.output_dir}")
+    else:
+        logger.info("Skipping disk export (pass --save-model to write weights and report).")
 
     if args.publish:
-        logger.info(f"Publishing model to Hugging Face Hub: {args.publish}")
-        try:
-            HuggingFacePublisher.publish_model(args.output_dir, args.publish)
-        except Exception as e:
-            logger.error(f"Failed to publish: {e}")
+        if not args.save_model:
+            logger.warning("Publishing requires --save-model so files exist in --output-dir.")
+        else:
+            logger.info(f"Publishing model to Hugging Face Hub: {args.publish}")
+            try:
+                HuggingFacePublisher.publish_model(args.output_dir, args.publish)
+            except Exception as e:
+                logger.error(f"Failed to publish: {e}")
 
     if args.interactive:
         run_interactive_chat_with_commands(

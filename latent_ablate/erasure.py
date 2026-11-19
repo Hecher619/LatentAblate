@@ -67,32 +67,38 @@ def oblique_weights(r: torch.Tensor, basis: torch.Tensor) -> tuple:
     return r_unit, r_unit
 
 
-def apply_erasure(W: torch.Tensor, r: torch.Tensor, w: torch.Tensor, alpha: float) -> torch.Tensor:
+def apply_erasure(
+    W: torch.Tensor,
+    r: torch.Tensor,
+    w: torch.Tensor | None = None,
+    alpha: float = 1.0,
+) -> torch.Tensor:
     """
-    Applies directional ablation along unit refusal direction r_unit
-    on a 2D linear weight matrix W of shape [out_features, in_features].
+    Applies directional ablation along unit direction `w` (if provided and non-zero),
+    falling back to normalized `r`, on a 2D linear weight matrix W [out_features, in_features].
     """
     device = W.device
     W_f32 = W.float().to(device)
-    r_f = r.to(device).float()
-    r_unit = r_f / r_f.norm().clamp_min(1e-8)
-
     if W_f32.ndim != 2:
         return W_f32
 
-    out_features, in_features = W_f32.shape
-    dim = r_unit.shape[0]
+    target_vec = w if (w is not None and w.numel() > 0 and w.norm().item() > 1e-8) else r
+    u = target_vec.to(device).float()
+    u = u / u.norm().clamp_min(1e-8)
 
-    # Residual stream is output space (e.g., o_proj, down_proj: [hidden, d_inner])
+    out_features, in_features = W_f32.shape
+    dim = u.shape[0]
+
+    # Residual stream in output space (e.g., o_proj, down_proj: [hidden, d_inner])
     if out_features == dim:
-        proj = torch.mv(W_f32.T, r_unit)
-        delta = alpha * torch.outer(r_unit, proj)
+        proj = torch.mv(W_f32.T, u)
+        delta = alpha * torch.outer(u, proj)
         return W_f32 - delta
 
-    # Residual stream is input space (e.g., q_proj, k_proj, v_proj, gate_proj, up_proj: [d_proj, hidden])
+    # Residual stream in input space (e.g., q_proj, k_proj, v_proj, gate_proj, up_proj: [d_proj, hidden])
     if in_features == dim:
-        proj = torch.mv(W_f32, r_unit)
-        delta = alpha * torch.outer(proj, r_unit)
+        proj = torch.mv(W_f32, u)
+        delta = alpha * torch.outer(proj, u)
         return W_f32 - delta
 
     return W_f32

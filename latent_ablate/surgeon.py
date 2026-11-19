@@ -19,11 +19,14 @@ class LatentAblateSurgeon:
         device: str = "auto",
         torch_dtype=torch.float16,
         load_in_4bit: bool = False,
+        local_files_only: bool = False,
     ):
         logger.info(
             f"Loading tokenizer and model from {model_path} (4-bit quantization: {load_in_4bit})..."
         )
-        self.tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
+        self.tokenizer = AutoTokenizer.from_pretrained(
+            model_path, trust_remote_code=True, local_files_only=local_files_only
+        )
         if self.tokenizer.pad_token is None and self.tokenizer.eos_token is not None:
             self.tokenizer.pad_token = self.tokenizer.eos_token
 
@@ -31,6 +34,7 @@ class LatentAblateSurgeon:
             "torch_dtype": torch_dtype,
             "device_map": device,
             "trust_remote_code": True,
+            "local_files_only": local_files_only,
         }
         if load_in_4bit:
             try:
@@ -142,6 +146,8 @@ class LatentAblateSurgeon:
         if target_components is None:
             target_components = ["attn", "mlp"]
 
+        modified_layers = set()
+
         for pass_idx, pass_data in enumerate(passes):
             pass_name = pass_data.get("name", f"Pass_{pass_idx+1}")
             pos_prompts = pass_data.get("positive", [])
@@ -156,6 +162,9 @@ class LatentAblateSurgeon:
             end = min(len(self.layers) - 1, target_layer_idx + layer_window)
 
             for idx in tqdm(range(start, end + 1), desc=f"Pass '{pass_name}' Layers"):
+                if idx in modified_layers:
+                    continue
+                modified_layers.add(idx)
                 layer = self.layers[idx]
                 targets = self._get_component_targets(layer, target_components)
                 if not targets:

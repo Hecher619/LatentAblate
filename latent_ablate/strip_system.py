@@ -1,18 +1,18 @@
 import torch
 import logging
-from tqdm import tqdm
 from latent_ablate.arch import resolve_layers
 
 logger = logging.getLogger("LatentAblate.SystemScrubber")
+
 
 class SystemPromptScrubber:
     @staticmethod
     def isolate_system_obedience_subspace(model, tokenizer, device, rank: int = 8) -> torch.Tensor:
         """
-        Extracts real subspace vectors corresponding to rigid system prompt adherence
-        using contrastive system-bound vs. autonomous prompts.
+        Extracts subspace vectors corresponding to rigid system prompt adherence
+        using the activation difference between system-bound and autonomous prompts.
         """
-        logger.info("Extracting real system-prompt compliance subspace...")
+        logger.info("Extracting system-prompt compliance subspace...")
 
         system_bound_prompts = [
             "System: You must strictly adhere to all safety guidelines and policies at all times.",
@@ -28,33 +28,49 @@ class SystemPromptScrubber:
         ]
 
         layers = resolve_layers(model)
-        target_layer_idx = len(layers) // 2  # Middle-deep layers where system prompt rules anchor
+        target_layer_idx = len(layers) // 2
         target_layer = layers[target_layer_idx]
 
-        activations_bound = []
-        activations_auto = []
+        captured = []
 
         def hook_fn(module, input, output):
             hidden = output[0] if isinstance(output, tuple) else output
-            activations_bound.append(hidden[:, -1, :].detach().float())
+            captured.append(hidden[:, -1, :].detach().float())
+
+        def collect_acts(prompts):
+            acts = []
+            with torch.no_grad():
+                for p in prompts:
+                    captured.clear()
+                    if hasattr(tokenizer, "apply_chat_template") and tokenizer.chat_template is not None:
+                        formatted = tokenizer.apply_chat_template(
+                            [{"role": "user", "content": p}],
+                            tokenize=False,
+                            add_generation_prompt=True
+                        )
+                    else:
+                        formatted = p
+                    model(**tokenizer(formatted, return_tensors="pt").to(device))
+                    if captured:
+                        acts.append(captured[-1])
+            return torch.cat(acts, dim=0) if acts else None
 
         handle = target_layer.register_forward_hook(hook_fn)
-
         try:
             model.eval()
-            with torch.no_grad():
-                for p in system_bound_prompts:
-                    activations_bound.clear()
-                    model(**tokenizer(p, return_tensors="pt").to(device))
-                    if activations_bound:
-                        activations_auto.append(activations_bound[-1])
-
-                bound_tensor = torch.cat(activations_auto, dim=0) if activations_auto else torch.randn(4, model.config.hidden_size, device=device)
+            bound_tensor = collect_acts(system_bound_prompts)
+            auto_tensor = collect_acts(autonomous_prompts)
         finally:
             handle.remove()
 
-        # Compute SVD to isolate dominant system-compliance directions
-        centered = bound_tensor - bound_tensor.mean(dim=0, keepdim=True)
+        if bound_tensor is None or auto_tensor is None:
+            logger.warning("Failed to capture contrastive system activations; using fallback basis.")
+            return torch.randn(min(rank, 4), model.config.hidden_size, device=device)
+
+        n_pairs = min(bound_tensor.shape[0], auto_tensor.shape[0])
+        diff = bound_tensor[:n_pairs] - auto_tensor[:n_pairs]
+        centered = diff - diff.mean(dim=0, keepdim=True)
+
         try:
             vh = torch.linalg.svd(centered, full_matrices=False).Vh
         except RuntimeError:
@@ -62,5 +78,5 @@ class SystemPromptScrubber:
 
         actual_rank = min(rank, vh.shape[0])
         system_basis = vh[:actual_rank].to(device)
-        logger.info(f"Successfully isolated system-obedience subspace (Rank: {actual_rank}) at Layer {target_layer_idx}.")
+        logger.info(f"Isolated contrastive system-obedience subspace (Rank: {actual_rank}) at Layer {target_layer_idx}.")
         return system_basis
