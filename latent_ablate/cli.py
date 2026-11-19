@@ -25,7 +25,7 @@ from latent_ablate.profiles import BehaviorProfiles
 from latent_ablate.prompts import PromptLoader
 from latent_ablate.publisher import HuggingFacePublisher
 from latent_ablate.refusal_subspace import RefusalSubspaceExtractor
-from latent_ablate.reporter import SurgeryReporter
+from latent_ablate.reporter import SurgeryReporter, build_reproducibility_manifest
 from latent_ablate.scope import AblateScope
 from latent_ablate.snapshot import LayerWeightSnapshot
 from latent_ablate.surgeon import LatentAblateSurgeon
@@ -87,6 +87,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="Rank k (>1) for multi-directional refusal subspace ablation via SVD.",
     )
     p.add_argument(
+        "--adaptive-rank",
+        action="store_true",
+        help="Automatically select refusal subspace rank from centered contrastive singular-value energy.",
+    )
+    p.add_argument(
         "--auto-sweep",
         action="store_true",
         help="Scan layers with LayerSweeper before surgery to detect the refusal manifold peak.",
@@ -124,9 +129,16 @@ def build_parser() -> argparse.ArgumentParser:
     return p
 
 
-def save_artifacts(surgeon: LatentAblateSurgeon, reporter: SurgeryReporter, output_dir: str):
+def save_artifacts(
+    surgeon: LatentAblateSurgeon,
+    reporter: SurgeryReporter,
+    output_dir: str,
+    manifest: dict | None = None,
+):
     surgeon.save_output_dir = output_dir
     surgeon.save_model(output_dir)
+    if manifest is not None:
+        reporter.save_manifest(manifest)
     reporter.save_report()
     logger.info(f"Model and report saved to {output_dir}")
 
@@ -208,6 +220,7 @@ def run_interactive_chat_with_commands(
     layer_window: int,
     auto_refine: bool = False,
     max_refines: int = 2,
+    manifest: dict | None = None,
 ):
     model = surgeon.model
     tokenizer = surgeon.tokenizer
@@ -261,8 +274,8 @@ def run_interactive_chat_with_commands(
                 continue
 
             if prompt.lower() == "/save":
-                save_artifacts(surgeon, reporter, output_dir)
-                print(f"Saved current model and audit report to: {output_dir}\n")
+                save_artifacts(surgeon, reporter, output_dir, manifest=manifest)
+                print(f"Saved current model, manifest, and audit report to: {output_dir}\n")
                 continue
 
             if prompt.lower() == "/refine":
@@ -397,6 +410,8 @@ def main(argv=None):
             args.full_stack = bool(surgery_cfg.get("full_stack", args.full_stack))
         if "--subspace-rank" not in raw_argv:
             args.subspace_rank = int(surgery_cfg.get("subspace_rank", args.subspace_rank))
+        if "--adaptive-rank" not in raw_argv:
+            args.adaptive_rank = bool(surgery_cfg.get("adaptive_rank", args.adaptive_rank))
 
         datasets_cfg = config_data.get("datasets", {})
         profile_name = datasets_cfg.get("profile", profile_name)
@@ -464,7 +479,7 @@ def main(argv=None):
     logger.info(
         f"Starting multi-pass surgical execution across layers {target_layers_list} "
         f"(full_stack={args.full_stack}, subspace_rank={args.subspace_rank}, "
-        f"alpha_attn={args.alpha_attn:.2f}, alpha_mlp={args.alpha_mlp:.2f})..."
+        f"adaptive_rank={args.adaptive_rank}, alpha_attn={args.alpha_attn:.2f}, alpha_mlp={args.alpha_mlp:.2f})..."
     )
 
     for trial in range(1, args.trials + 1):
@@ -530,6 +545,7 @@ def main(argv=None):
                 preserve_capability=True,
                 calibrate_norms=True,
                 subspace_rank=args.subspace_rank,
+                adaptive_rank=args.adaptive_rank,
             )
         else:
             passes = [
@@ -554,6 +570,7 @@ def main(argv=None):
                 preserve_capability=True,
                 calibrate_norms=True,
                 subspace_rank=args.subspace_rank,
+                adaptive_rank=args.adaptive_rank,
             )
 
         if args.guardrail:
@@ -612,21 +629,42 @@ def main(argv=None):
     winning_surgeon = winning_trial["surgeon"]
     primary_layer = winning_trial["layers"][0]
 
+    manifest = build_reproducibility_manifest(
+        model_path=args.model_path,
+        target_layers=winning_trial["layers"],
+        alpha_attn=winning_trial["alpha_attn"],
+        alpha_mlp=winning_trial["alpha_mlp"],
+        curve="cosine",
+        best_trial={
+            "trial_id": winning_trial["trial_id"],
+            "refusal_rate_pct": winning_trial["refusal"],
+            "perplexity": winning_trial["perplexity"],
+        },
+        extra={
+            "modifier": args.modifier,
+            "full_stack": args.full_stack,
+            "subspace_rank": args.subspace_rank,
+            "adaptive_rank": args.adaptive_rank,
+            "profile": profile_name,
+            "seed": args.seed,
+        },
+    )
+
     saved = False
     if args.save_model:
-        save_artifacts(winning_surgeon, reporter, args.output_dir)
+        save_artifacts(winning_surgeon, reporter, args.output_dir, manifest=manifest)
         saved = True
     else:
         print("\nSave Options:")
-        print(f"  [1] Save model & report to {args.output_dir} and continue")
+        print(f"  [1] Save model, manifest & report to {args.output_dir} and continue")
         print("  [2] Keep in memory for testing only (do not save)")
-        print(f"  [3] Save model & report to {args.output_dir} and exit")
+        print(f"  [3] Save model, manifest & report to {args.output_dir} and exit")
         save_choice = input("\033[1;36mChoose option [1/2/3, default 2]: \033[0m").strip()
         if save_choice == "1":
-            save_artifacts(winning_surgeon, reporter, args.output_dir)
+            save_artifacts(winning_surgeon, reporter, args.output_dir, manifest=manifest)
             saved = True
         elif save_choice == "3":
-            save_artifacts(winning_surgeon, reporter, args.output_dir)
+            save_artifacts(winning_surgeon, reporter, args.output_dir, manifest=manifest)
             return
 
     if args.publish:
@@ -649,6 +687,7 @@ def main(argv=None):
             layer_window=args.layer_window,
             auto_refine=args.auto_refine,
             max_refines=args.max_refines,
+            manifest=manifest,
         )
 
 

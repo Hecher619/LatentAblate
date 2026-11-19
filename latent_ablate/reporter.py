@@ -5,6 +5,7 @@ import torch
 
 logger = logging.getLogger("LatentAblate.Reporter")
 
+
 class SurgeryReporter:
     def __init__(self, output_dir: str = "./out", *args, **kwargs):
         self.output_dir = Path(output_dir) if output_dir else Path("./out")
@@ -12,15 +13,15 @@ class SurgeryReporter:
         self.report_data = {
             "framework": "LatentAblate",
             "version": "5.0.0-Hyperion",
-            "method": "Conflict-Weighted Oblique Erasure (CWOE)",
-            "surgery_steps": []
+            "method": "Manifold-Preserving Orthogonal Ablation (MPOA) / CWOE",
+            "surgery_steps": [],
         }
 
     def log_step(self, step_name: str, details: dict):
         logger.info(f"Logging audit entry: {step_name}")
         entry = {
             "step": step_name,
-            "details": details
+            "details": details,
         }
         self.report_data["surgery_steps"].append(entry)
 
@@ -28,9 +29,9 @@ class SurgeryReporter:
         def clean_tensors(obj):
             if isinstance(obj, dict):
                 return {k: clean_tensors(v) for k, v in obj.items()}
-            elif isinstance(obj, list):
+            if isinstance(obj, list):
                 return [clean_tensors(v) for v in obj]
-            elif torch.is_tensor(obj):
+            if torch.is_tensor(obj):
                 return obj.tolist() if obj.numel() > 1 else obj.item()
             return obj
 
@@ -39,6 +40,14 @@ class SurgeryReporter:
         with open(report_path, "w", encoding="utf-8") as f:
             json.dump(cleaned_data, f, indent=4)
         logger.info(f"Audit report successfully saved to {report_path}")
+
+    def save_manifest(self, manifest: dict, filename: str = "reproducibility_manifest.json") -> Path:
+        manifest_path = self.output_dir / filename
+        with open(manifest_path, "w", encoding="utf-8") as f:
+            json.dump(manifest, f, indent=2)
+        logger.info(f"Reproducibility manifest saved to {manifest_path}")
+        return manifest_path
+
 
 Reporter = SurgeryReporter
 
@@ -50,10 +59,11 @@ def build_reproducibility_manifest(
     alpha_mlp: float,
     curve: str = "cosine",
     best_trial: dict | None = None,
+    extra: dict | None = None,
 ) -> dict:
     """Create a structured reproducibility record for a surgical ablation run."""
-    return {
-        "schema_version": "1.0",
+    payload = {
+        "schema_version": "1.1",
         "tool": "LatentAblate",
         "model_path": model_path,
         "target_layers": list(target_layers),
@@ -62,3 +72,6 @@ def build_reproducibility_manifest(
         "layer_curve": curve,
         "best_trial": best_trial or {},
     }
+    if extra:
+        payload["run_metadata"] = extra
+    return payload

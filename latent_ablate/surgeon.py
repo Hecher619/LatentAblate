@@ -9,6 +9,8 @@ from latent_ablate.extractor import ActivationExtractor
 from latent_ablate.subspace import SubspaceIsolator, refusal_direction
 from latent_ablate.erasure import (
     conflict_score,
+    conflict_scaled_alpha,
+    select_energy_rank,
     build_capability_basis,
     oblique_weights,
     apply_erasure,
@@ -123,6 +125,9 @@ class LatentAblateSurgeon:
         all_layers: bool = False,
         subspace_rank: int = 1,
         rank_decay: float = 0.75,
+        adaptive_rank: bool = False,
+        target_energy: float = 0.85,
+        conflict_scaling: bool = True,
     ):
         effective_window = len(self.layers) if all_layers else layer_window
         passes = [
@@ -147,6 +152,9 @@ class LatentAblateSurgeon:
             layer_curve=layer_curve,
             subspace_rank=subspace_rank,
             rank_decay=rank_decay,
+            adaptive_rank=adaptive_rank,
+            target_energy=target_energy,
+            conflict_scaling=conflict_scaling,
         )
 
     def execute_full_stack_surgery(
@@ -163,6 +171,9 @@ class LatentAblateSurgeon:
         layer_curve: str = "cosine",
         subspace_rank: int = 1,
         rank_decay: float = 0.75,
+        adaptive_rank: bool = False,
+        target_energy: float = 0.85,
+        conflict_scaling: bool = True,
     ):
         """
         Stacks multiple layer-band passes from early-mid to late layers with gentle
@@ -201,6 +212,9 @@ class LatentAblateSurgeon:
             layer_curve=layer_curve,
             subspace_rank=subspace_rank,
             rank_decay=rank_decay,
+            adaptive_rank=adaptive_rank,
+            target_energy=target_energy,
+            conflict_scaling=conflict_scaling,
         )
 
     def execute_multi_pass_surgery(
@@ -218,12 +232,15 @@ class LatentAblateSurgeon:
         layer_curve: str = "cosine",
         subspace_rank: int = 1,
         rank_decay: float = 0.75,
+        adaptive_rank: bool = False,
+        target_energy: float = 0.85,
+        conflict_scaling: bool = True,
     ):
         if target_components is None:
             target_components = ["attn", "mlp"]
 
         modified_layers = set()
-        effective_subspace_rank = max(1, int(subspace_rank))
+        base_subspace_rank = max(1, int(subspace_rank))
 
         for pass_idx, pass_data in enumerate(passes):
             pass_name = pass_data.get("name", f"Pass_{pass_idx+1}")
@@ -258,9 +275,15 @@ class LatentAblateSurgeon:
                 neg = self.extractor.extract_hidden_states(neg_prompts, idx).to(layer_device)
                 r = refusal_direction(pos, neg).to(layer_device)
 
-                if effective_subspace_rank > 1 and pos.shape[0] == neg.shape[0] and pos.shape[0] >= 2:
+                effective_rank = (
+                    select_energy_rank(pos, neg, max_rank=max(base_subspace_rank, 8), target_energy=target_energy)
+                    if adaptive_rank
+                    else base_subspace_rank
+                )
+
+                if effective_rank > 1 and pos.shape[0] == neg.shape[0] and pos.shape[0] >= 2:
                     subspace_vecs = SubspaceIsolator.compute_refusal_subspace(
-                        pos, neg, rank=effective_subspace_rank
+                        pos, neg, rank=effective_rank
                     ).to(layer_device)
                 else:
                     subspace_vecs = r.unsqueeze(0)
@@ -280,8 +303,15 @@ class LatentAblateSurgeon:
                 gaussian_weight = math.exp(-0.10 * (distance_from_peak / max(1, pass_window)) ** 2)
                 curve_mult = layer_multipliers.get(idx, 1.0)
 
-                alpha_attn = pass_alpha_attn * max(gaussian_weight, 0.85) * curve_mult
-                alpha_mlp = pass_alpha_mlp * max(gaussian_weight, 0.85) * curve_mult
+                raw_alpha_attn = pass_alpha_attn * max(gaussian_weight, 0.85) * curve_mult
+                raw_alpha_mlp = pass_alpha_mlp * max(gaussian_weight, 0.85) * curve_mult
+
+                if conflict_scaling and preserve_capability:
+                    alpha_attn = conflict_scaled_alpha(raw_alpha_attn, conflict)
+                    alpha_mlp = conflict_scaled_alpha(raw_alpha_mlp, conflict)
+                else:
+                    alpha_attn = raw_alpha_attn
+                    alpha_mlp = raw_alpha_mlp
 
                 r_attn_unit, w_attn = oblique_weights(r, cap_basis_attn)
                 r_mlp_unit, w_mlp = oblique_weights(r, cap_basis_mlp)

@@ -4,11 +4,14 @@ from latent_ablate.cli import build_parser
 from latent_ablate.erasure import (
     apply_erasure,
     build_capability_basis,
+    conflict_scaled_alpha,
     explained_variance_ratio,
     oblique_weights,
     preserve_row_norms,
+    select_energy_rank,
 )
 from latent_ablate.optimizer import compute_kernel_layer_weights, compute_layer_weights
+from latent_ablate.reporter import SurgeryReporter, build_reproducibility_manifest
 from latent_ablate.riemannian_steering import RiemannianGeodesicEngine
 from latent_ablate.scope import AblateScope
 
@@ -33,6 +36,21 @@ def test_capability_basis_is_orthonormal_and_tracks_variance():
     ev_small = explained_variance_ratio(cap_acts, rank=2)
     ev_large = explained_variance_ratio(cap_acts, rank=10)
     assert 0.0 < ev_small <= ev_large <= 1.0
+
+
+def test_adaptive_rank_and_conflict_scaled_alpha():
+    torch.manual_seed(42)
+    # Rank-1 dominant signal across 8 pairs
+    u = torch.nn.functional.normalize(torch.randn(32), dim=0)
+    coeffs = torch.linspace(-2.0, 2.0, steps=8).unsqueeze(1)
+    pos = coeffs * u.unsqueeze(0)
+    neg = torch.zeros_like(pos)
+    chosen_rank = select_energy_rank(pos, neg, max_rank=6, target_energy=0.85)
+    assert chosen_rank == 1
+
+    low_conflict_alpha = conflict_scaled_alpha(1.0, c_score=0.05)
+    high_conflict_alpha = conflict_scaled_alpha(1.0, c_score=0.95)
+    assert low_conflict_alpha > high_conflict_alpha >= 0.25
 
 
 def test_oblique_weights_reduces_capability_overlap():
@@ -75,12 +93,13 @@ def test_layer_weight_curves():
     assert kernel_w[12] >= kernel_w[10]
 
 
-def test_cli_flags_and_scope_roundtrip(tmp_path):
+def test_cli_flags_scope_and_manifest(tmp_path):
     parser = build_parser()
     args = parser.parse_args([
         "--modifier", "mpoa",
         "--full-stack",
         "--subspace-rank", "3",
+        "--adaptive-rank",
         "--auto-sweep",
         "--guardrail",
         "--scope-out", str(tmp_path / "spec.json"),
@@ -88,6 +107,7 @@ def test_cli_flags_and_scope_roundtrip(tmp_path):
     assert args.modifier == "mpoa"
     assert args.full_stack is True
     assert args.subspace_rank == 3
+    assert args.adaptive_rank is True
     assert args.auto_sweep is True
     assert args.guardrail is True
 
@@ -102,3 +122,14 @@ def test_cli_flags_and_scope_roundtrip(tmp_path):
     AblateScope.save_spec(spec, str(out_file))
     loaded = AblateScope.load_spec(str(out_file))
     assert loaded == spec
+
+    reporter = SurgeryReporter(str(tmp_path / "out"))
+    manifest = build_reproducibility_manifest(
+        model_path="Qwen/Qwen2.5-1.5B-Instruct",
+        target_layers=[14],
+        alpha_attn=0.95,
+        alpha_mlp=0.85,
+        extra={"seed": 42},
+    )
+    manifest_file = reporter.save_manifest(manifest)
+    assert manifest_file.exists()

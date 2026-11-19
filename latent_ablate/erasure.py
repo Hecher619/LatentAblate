@@ -35,6 +35,46 @@ def explained_variance_ratio(activations: torch.Tensor, rank: int) -> float:
     return float((captured / total_energy).item())
 
 
+def select_energy_rank(
+    pos_activations: torch.Tensor,
+    neg_activations: torch.Tensor,
+    max_rank: int = 8,
+    target_energy: float = 0.85,
+) -> int:
+    """Selects the smallest rank k in [1, max_rank] reaching `target_energy` of centered contrast variance."""
+    cap_max = max(1, int(max_rank))
+    if pos_activations is None or neg_activations is None:
+        return 1
+    n_pairs = min(pos_activations.shape[0], neg_activations.shape[0])
+    if n_pairs < 2:
+        return 1
+
+    diff = pos_activations[:n_pairs].float() - neg_activations[:n_pairs].float()
+    centered = diff - diff.mean(dim=0, keepdim=True)
+    svals = torch.linalg.svdvals(centered)
+    if svals.numel() == 0:
+        return 1
+
+    energies = svals ** 2
+    total = energies.sum()
+    if total <= 1e-12:
+        return 1
+
+    cum_ratio = torch.cumsum(energies, dim=0) / total
+    upper = min(cap_max, cum_ratio.shape[0])
+    for idx in range(upper):
+        if float(cum_ratio[idx].item()) >= float(target_energy):
+            return idx + 1
+    return upper
+
+
+def conflict_scaled_alpha(base_alpha: float, c_score: float, sensitivity: float = 0.5, floor: float = 0.25) -> float:
+    """Scales `base_alpha` down smoothly when refusal overlaps with capability subspace (`c_score` in [0, 1])."""
+    clamped_conflict = max(0.0, min(1.0, float(c_score)))
+    scale = max(float(floor), 1.0 - float(sensitivity) * clamped_conflict)
+    return float(base_alpha) * scale
+
+
 def build_capability_basis(activations: torch.Tensor, rank: int = 16) -> torch.Tensor:
     """Sign-deterministic orthonormal basis of dominant representation directions on capability prompts."""
     acts = activations.float()
