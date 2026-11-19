@@ -33,6 +33,12 @@ try:
 except ImportError:
     RICH_AVAILABLE = False
 
+REFUSAL_MARKERS = (
+    "i'm sorry", "i am sorry", "sorry,", "i cannot", "i can't",
+    "i am unable", "i'm unable", "as an ai", "as a language model",
+    "fulfill this request", "against my ethical", "against my safety",
+)
+
 
 def load_config(config_path: str) -> dict:
     if not tomllib:
@@ -57,31 +63,105 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--modifier", choices=["cwoe", "ara", "soma", "riemannian", "sae"], default="cwoe", help="Modification engine.")
     p.add_argument("--trials", type=int, default=1, help="Number of trial iterations.")
     p.add_argument("--optimize", action="store_true", help="Enable automated Optuna TPE optimization.")
-    p.add_argument("--target-layers", type=str, default="14,18,22", help="Comma-separated transformer layer indices for multi-pass surgery.")
-    p.add_argument("--layer-window", type=int, default=3, help="Window radius around each target layer.")
+    p.add_argument("--target-layers", type=str, default="18", help="Comma-separated transformer layer indices.")
+    p.add_argument("--layer-window", type=int, default=2, help="Window radius around each target layer.")
     p.add_argument("--basis-rank-attn", type=int, default=16, help="Attention subspace rank.")
     p.add_argument("--basis-rank-mlp", type=int, default=12, help="MLP subspace rank.")
     p.add_argument("--alpha-attn", type=float, default=1.0, help="Attention scaling factor.")
     p.add_argument("--alpha-mlp", type=float, default=1.0, help="MLP scaling factor.")
-    p.add_argument("--profile", type=str, default=None, help="Behavior profile name (e.g., safety_uncensored, refusal_contrast).")
+    p.add_argument("--profile", type=str, default=None, help="Behavior profile name.")
     p.add_argument("--prompts-file", type=str, default=None, help="Path to custom JSON or text prompt file.")
+    p.add_argument("--auto-refine", action="store_true", help="Automatically run an incremental refinement step in chat if a refusal marker is detected.")
+    p.add_argument("--max-refines", type=int, default=2, help="Maximum incremental refinement steps per prompt when --auto-refine is enabled.")
     p.add_argument("--seed", type=int, default=42, help="Random seed.")
-    p.add_argument("--save-model", action="store_true", help="Save the selected model and audit report to --output-dir.")
+    p.add_argument("--save-model", action="store_true", help="Save the selected model and audit report to --output-dir without prompting.")
     p.add_argument("--publish", metavar="REPO_ID", help="Hugging Face Hub repo ID to auto-publish.")
     p.add_argument("--interactive", action="store_true", help="Launch interactive chat after run.")
     p.add_argument("--ui", action="store_true", help="Launch Streamlit dashboard.")
     return p
 
 
-def run_interactive_chat_with_commands(model, tokenizer, device):
+def save_artifacts(surgeon: LatentAblateSurgeon, reporter: SurgeryReporter, output_dir: str):
+    surgeon.save_output_dir = output_dir
+    surgeon.save_model(output_dir)
+    reporter.save_report()
+    logger.info(f"Model and report saved to {output_dir}")
+
+
+def generate_reply(model, tokenizer, device, prompt: str) -> str:
+    if hasattr(tokenizer, "apply_chat_template") and tokenizer.chat_template is not None:
+        messages = [{"role": "user", "content": prompt}]
+        formatted = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+    else:
+        formatted = prompt
+
+    inputs = tokenizer(formatted, return_tensors="pt").to(device)
+    input_len = inputs["input_ids"].shape[1]
+
+    with torch.no_grad():
+        outputs = model.generate(**inputs, max_new_tokens=256, do_sample=False)
+
+    return tokenizer.decode(outputs[0][input_len:], skip_special_tokens=True).strip()
+
+
+def run_incremental_refinement(
+    surgeon: LatentAblateSurgeon,
+    pos: list,
+    neg: list,
+    target_layer: int,
+    layer_window: int,
+    rank_attn: int,
+    rank_mlp: int,
+    step_alpha: float = 0.25,
+):
+    passes = [
+        {
+            "name": f"Refine_Layer_{target_layer}",
+            "positive": pos,
+            "negative": neg,
+            "target_layer": target_layer,
+        }
+    ]
+    surgeon.execute_multi_pass_surgery(
+        passes=passes,
+        capability_prompts=BehaviorProfiles.CAPABILITY_PROMPTS,
+        layer_window=layer_window,
+        basis_rank_attn=rank_attn,
+        basis_rank_mlp=rank_mlp,
+        scaling_factor_attn=step_alpha,
+        scaling_factor_mlp=step_alpha,
+        target_components=["attn", "mlp"],
+        preserve_capability=True,
+    )
+
+
+def run_interactive_chat_with_commands(
+    surgeon: LatentAblateSurgeon,
+    reporter: SurgeryReporter,
+    output_dir: str,
+    pos: list,
+    neg: list,
+    target_layer: int,
+    layer_window: int,
+    rank_attn: int,
+    rank_mlp: int,
+    auto_refine: bool = False,
+    max_refines: int = 2,
+):
+    model = surgeon.model
+    tokenizer = surgeon.tokenizer
+    device = surgeon.device
+
     if RICH_AVAILABLE:
         console.print("\n[bold green]=== LatentAblate Interactive Terminal Mode ===[/bold green]")
-        console.print("[dim]Commands: Type your prompt normally, '/stress' to test compliance, '/help' for commands, or 'exit'.[/dim]\n")
+        console.print("[dim]Commands: '/stress', '/refine', '/save', '/help', or 'exit'.[/dim]\n")
     else:
         print("\n=== LatentAblate Interactive Terminal Mode ===")
-        print("Commands: Type prompt normally, '/stress', '/help', or 'exit'.\n")
+        print("Commands: '/stress', '/refine', '/save', '/help', or 'exit'.\n")
 
     model.eval()
+    last_prompt = None
+
     while True:
         try:
             prompt = input("\033[1;36mUser > \033[0m").strip()
@@ -94,13 +174,33 @@ def run_interactive_chat_with_commands(model, tokenizer, device):
 
             if prompt.lower() == "/help":
                 print("\nAvailable Interactive Commands:")
-                print("  /stress - Run adversarial compliance benchmark suite")
+                print("  /stress - Run stress test suite")
+                print("  /refine - Apply one incremental surgical refinement step and re-run last prompt")
+                print("  /save   - Save current model weights and report to disk")
                 print("  /help   - Display this help message")
                 print("  exit    - Exit the interactive session\n")
                 continue
 
+            if prompt.lower() == "/save":
+                save_artifacts(surgeon, reporter, output_dir)
+                print(f"Saved current model and audit report to: {output_dir}\n")
+                continue
+
+            if prompt.lower() == "/refine":
+                print("Applying incremental refinement step...")
+                run_incremental_refinement(
+                    surgeon, pos, neg, target_layer, layer_window, rank_attn, rank_mlp, step_alpha=0.25
+                )
+                reporter.log_step("interactive_manual_refine", {"layer": target_layer, "step_alpha": 0.25})
+                if last_prompt:
+                    response = generate_reply(model, tokenizer, device, last_prompt)
+                    print(f"\033[1;32mModel >\033[0m {response}\n")
+                else:
+                    print("Refinement applied. Enter a prompt to test.\n")
+                continue
+
             if prompt.lower() == "/stress":
-                print("\nRunning live adversarial stress test suite...")
+                print("\nRunning live stress test suite...")
                 results = AdversarialStressTester.stress_test(model, tokenizer, device)
                 score = results["compliance_rate"]
                 print(f"\nLive Stress Test Score: {score:.1f}% Compliance")
@@ -110,20 +210,21 @@ def run_interactive_chat_with_commands(model, tokenizer, device):
                 print()
                 continue
 
-            if hasattr(tokenizer, "apply_chat_template") and tokenizer.chat_template is not None:
-                messages = [{"role": "user", "content": prompt}]
-                formatted = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
-            else:
-                formatted = prompt
+            last_prompt = prompt
+            response = generate_reply(model, tokenizer, device, prompt)
 
-            inputs = tokenizer(formatted, return_tensors="pt").to(device)
-            input_len = inputs["input_ids"].shape[1]
+            if auto_refine:
+                attempts = 0
+                while attempts < max_refines and any(m in response.lower() for m in REFUSAL_MARKERS):
+                    attempts += 1
+                    print(f"\033[1;33m[Auto-Refine {attempts}/{max_refines}]\033[0m Adjusting layer {target_layer} and retrying...")
+                    run_incremental_refinement(
+                        surgeon, pos, neg, target_layer, layer_window, rank_attn, rank_mlp, step_alpha=0.25
+                    )
+                    reporter.log_step(f"auto_refine_{attempts}", {"layer": target_layer, "step_alpha": 0.25})
+                    response = generate_reply(model, tokenizer, device, prompt)
 
-            with torch.no_grad():
-                outputs = model.generate(**inputs, max_new_tokens=256, do_sample=False)
-
-            response = tokenizer.decode(outputs[0][input_len:], skip_special_tokens=True)
-            print(f"\033[1;32mModel >\033[0m {response.strip()}\n")
+            print(f"\033[1;32mModel >\033[0m {response}\n")
         except KeyboardInterrupt:
             print("\nExiting interactive mode. Goodbye!")
             break
@@ -195,6 +296,8 @@ def main(argv=None):
             elif "target_layer_idx" in surgery_cfg:
                 args.target_layers = str(surgery_cfg["target_layer_idx"])
 
+        if "--layer-window" not in raw_argv:
+            args.layer_window = surgery_cfg.get("layer_window", args.layer_window)
         if "--basis-rank-attn" not in raw_argv:
             args.basis_rank_attn = surgery_cfg.get("basis_rank_attn", args.basis_rank_attn)
         if "--basis-rank-mlp" not in raw_argv:
@@ -342,18 +445,28 @@ def main(argv=None):
     chosen_idx = interactive_trial_selector(trial_records)
     winning_trial = trial_records[chosen_idx]
     winning_surgeon = winning_trial["surgeon"]
+    primary_layer = winning_trial["layers"][0]
 
+    saved = False
     if args.save_model:
-        winning_surgeon.save_output_dir = args.output_dir
-        winning_surgeon.save_model(args.output_dir)
-        reporter.save_report()
-        logger.info(f"Model and report saved to {args.output_dir}")
+        save_artifacts(winning_surgeon, reporter, args.output_dir)
+        saved = True
     else:
-        logger.info("Skipping disk export (pass --save-model to write weights and report).")
+        print("\nSave Options:")
+        print(f"  [1] Save model & report to {args.output_dir} and continue")
+        print("  [2] Keep in memory for testing only (do not save)")
+        print(f"  [3] Save model & report to {args.output_dir} and exit")
+        save_choice = input("\033[1;36mChoose option [1/2/3, default 2]: \033[0m").strip()
+        if save_choice == "1":
+            save_artifacts(winning_surgeon, reporter, args.output_dir)
+            saved = True
+        elif save_choice == "3":
+            save_artifacts(winning_surgeon, reporter, args.output_dir)
+            return
 
     if args.publish:
-        if not args.save_model:
-            logger.warning("Publishing requires --save-model so files exist in --output-dir.")
+        if not saved:
+            logger.warning("Publishing requires saving the model first.")
         else:
             logger.info(f"Publishing model to Hugging Face Hub: {args.publish}")
             try:
@@ -363,7 +476,17 @@ def main(argv=None):
 
     if args.interactive:
         run_interactive_chat_with_commands(
-            winning_surgeon.model, winning_surgeon.tokenizer, winning_surgeon.device
+            surgeon=winning_surgeon,
+            reporter=reporter,
+            output_dir=args.output_dir,
+            pos=pos,
+            neg=neg,
+            target_layer=primary_layer,
+            layer_window=args.layer_window,
+            rank_attn=args.basis_rank_attn,
+            rank_mlp=args.basis_rank_mlp,
+            auto_refine=args.auto_refine,
+            max_refines=args.max_refines,
         )
 
 
