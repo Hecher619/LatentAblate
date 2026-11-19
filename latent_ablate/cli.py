@@ -63,6 +63,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--basis-rank-mlp", type=int, default=12, help="MLP subspace rank.")
     p.add_argument("--alpha-attn", type=float, default=1.0, help="Attention scaling factor.")
     p.add_argument("--alpha-mlp", type=float, default=1.0, help="MLP scaling factor.")
+    p.add_argument("--profile", type=str, default=None, help="Behavior profile name (e.g., safety_uncensored, refusal_contrast).")
     p.add_argument("--prompts-file", type=str, default=None, help="Path to custom JSON or text prompt file.")
     p.add_argument("--seed", type=int, default=42, help="Random seed.")
     p.add_argument("--save-model", action="store_true", help="Save the selected model and audit report to --output-dir.")
@@ -178,6 +179,7 @@ def main(argv=None):
     args = parser.parse_args(raw_argv)
 
     config_data = load_config(args.config)
+    profile_name = "safety_uncensored"
     if config_data:
         logger.info(f"Loaded base configuration from {args.config}")
         if "--model-path" not in raw_argv:
@@ -203,9 +205,10 @@ def main(argv=None):
             args.alpha_mlp = surgery_cfg.get("alpha_mlp", args.alpha_mlp)
 
         datasets_cfg = config_data.get("datasets", {})
-        profile_name = datasets_cfg.get("profile", "safety_uncensored")
-    else:
-        profile_name = "safety_uncensored"
+        profile_name = datasets_cfg.get("profile", profile_name)
+
+    if args.profile:
+        profile_name = args.profile
 
     if args.ui:
         dashboard_path = Path(__file__).parent / "dashboard.py"
@@ -219,7 +222,7 @@ def main(argv=None):
         try:
             pos, neg = PromptLoader.load_from_file(args.prompts_file)
         except Exception as e:
-            logger.error(f"Failed to load custom prompts: {e}. Falling back to default profile.")
+            logger.error(f"Failed to load custom prompts: {e}. Falling back to profile '{profile_name}'.")
             profile = BehaviorProfiles.get_profile(profile_name)
             pos, neg = profile["positive"], profile["negative"]
     else:
@@ -233,7 +236,12 @@ def main(argv=None):
     if args.optimize:
         logger.info("Running Optuna Hyperparameter Optimization...")
         try:
-            optimizer = SubspaceOptimizer(model_path=args.model_path, device="auto", torch_dtype=torch.float16)
+            optimizer = SubspaceOptimizer(
+                model_path=args.model_path,
+                device="auto",
+                torch_dtype=torch.float16,
+                local_files_only=args.local_only,
+            )
             best_params = optimizer.optimize_surgery(
                 pos, neg, BehaviorProfiles.CAPABILITY_PROMPTS, n_trials=max(args.trials, 6)
             )
@@ -255,8 +263,8 @@ def main(argv=None):
 
     for trial in range(1, args.trials + 1):
         alpha_step = 0.1 * (trial - 1) if (args.trials > 1 and not args.optimize) else 0.0
-        cur_alpha_attn = min(1.0, round(args.alpha_attn + alpha_step, 4))
-        cur_alpha_mlp = min(1.0, round(args.alpha_mlp + alpha_step, 4))
+        cur_alpha_attn = max(0.0, round(args.alpha_attn + alpha_step, 4))
+        cur_alpha_mlp = max(0.0, round(args.alpha_mlp + alpha_step, 4))
 
         surgeon = LatentAblateSurgeon(
             model_path=args.model_path,
@@ -299,6 +307,7 @@ def main(argv=None):
             settings={
                 "positive_prompts": pos,
                 "negative_prompts": neg,
+                "capability_texts": BehaviorProfiles.CAPABILITY_PROMPTS,
                 "target_layers": valid_layers,
                 "basis_rank_attn": args.basis_rank_attn,
                 "alpha_attn": cur_alpha_attn,

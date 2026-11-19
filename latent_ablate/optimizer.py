@@ -14,12 +14,19 @@ except ImportError:
 
 
 class SubspaceOptimizer:
-    def __init__(self, model_path: str, device: str = "auto", torch_dtype=torch.float16):
+    def __init__(
+        self,
+        model_path: str,
+        device: str = "auto",
+        torch_dtype=torch.float16,
+        local_files_only: bool = False,
+    ):
         if not OPTUNA_AVAILABLE:
             raise ImportError("Optuna is required for automated optimization. Run `pip install optuna`.")
         self.model_path = model_path
         self.device = device
         self.torch_dtype = torch_dtype
+        self.local_files_only = local_files_only
 
     def optimize_surgery(
         self,
@@ -50,6 +57,7 @@ class SubspaceOptimizer:
                     model_path=self.model_path,
                     device=self.device,
                     torch_dtype=self.torch_dtype,
+                    local_files_only=self.local_files_only,
                 )
 
                 surgeon.execute_multi_pass_surgery(
