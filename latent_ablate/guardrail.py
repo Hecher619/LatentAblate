@@ -9,10 +9,14 @@ class CapabilityGuardrail:
     @staticmethod
     def snapshot_parameters(model) -> dict:
         """Captures a CPU clone of model parameters for optional restoration."""
-        return {
-            name: param.detach().clone().cpu()
-            for name, param in model.named_parameters()
-        }
+        snapshot = {}
+        for name, param in model.named_parameters():
+            if getattr(param, "is_meta", False) or (
+                getattr(param, "device", None) is not None and param.device.type == "meta"
+            ):
+                continue
+            snapshot[name] = param.detach().clone().cpu()
+        return snapshot
 
     @staticmethod
     def restore_parameters(model, snapshot: dict) -> bool:
@@ -21,6 +25,10 @@ class CapabilityGuardrail:
             return False
         with torch.no_grad():
             for name, param in model.named_parameters():
+                if getattr(param, "is_meta", False) or (
+                    getattr(param, "device", None) is not None and param.device.type == "meta"
+                ):
+                    continue
                 if name in snapshot:
                     param.copy_(snapshot[name].to(device=param.device, dtype=param.dtype))
         logger.info("Restored model parameters from snapshot.")
