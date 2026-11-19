@@ -7,7 +7,7 @@ ORTHO_FALLBACK = 1e-3
 
 
 def conflict_score(r: torch.Tensor, basis: torch.Tensor) -> float:
-    """Fraction of ||r|| that lies inside the capability subspace."""
+    """Fraction of ||r||_2 that lies inside the capability subspace span(basis)."""
     if basis is None or basis.numel() == 0 or r.is_meta:
         return 0.0
     device = r.device
@@ -19,11 +19,24 @@ def conflict_score(r: torch.Tensor, basis: torch.Tensor) -> float:
     if basis.ndim == 1:
         basis = basis.unsqueeze(0)
     proj = basis.T @ (basis @ r_unit)
-    return (proj.norm() / r_unit.norm().clamp_min(1e-8)).item()
+    return float((proj.norm() / r_unit.norm().clamp_min(1e-8)).item())
+
+
+def explained_variance_ratio(activations: torch.Tensor, rank: int) -> float:
+    """Fraction of centered activation variance captured by the top `rank` singular vectors."""
+    acts = activations.float()
+    if acts.shape[0] < 2:
+        return 1.0
+    centered = acts - acts.mean(dim=0, keepdim=True)
+    svals = torch.linalg.svdvals(centered)
+    total_energy = (svals ** 2).sum().clamp_min(1e-12)
+    k = max(1, min(rank, svals.shape[0]))
+    captured = (svals[:k] ** 2).sum()
+    return float((captured / total_energy).item())
 
 
 def build_capability_basis(activations: torch.Tensor, rank: int = 16) -> torch.Tensor:
-    """Orthonormal basis of dominant representation directions on capability prompts."""
+    """Sign-deterministic orthonormal basis of dominant representation directions on capability prompts."""
     acts = activations.float()
     if acts.shape[0] < 2:
         raise ValueError("Need >= 2 capability activations to build a basis.")
@@ -32,20 +45,31 @@ def build_capability_basis(activations: torch.Tensor, rank: int = 16) -> torch.T
     device = acts.device
 
     try:
-        vh = torch.linalg.svd(acts, full_matrices=False).Vh
+        _, svals, vh = torch.linalg.svd(acts, full_matrices=False)
     except RuntimeError:
         logger.warning("SVD failed on device, falling back to CPU for stable computation.")
-        vh = torch.linalg.svd(acts.cpu(), full_matrices=False).Vh.to(device)
+        _, svals, vh = torch.linalg.svd(acts.cpu(), full_matrices=False)
+        svals, vh = svals.to(device), vh.to(device)
 
-    k = min(rank, vh.shape[0])
+    k = max(1, min(rank, vh.shape[0]))
+    total_energy = (svals ** 2).sum().clamp_min(1e-12)
+    captured_ratio = float(((svals[:k] ** 2).sum() / total_energy).item())
+    if captured_ratio < 0.70:
+        logger.debug(
+            f"Capability basis rank={k} captures {captured_ratio * 100:.1f}% of variance; consider increasing rank."
+        )
+
     basis = vh[:k].to(device)
     if basis.shape[0] > 0:
-        basis = torch.linalg.qr(basis.T, mode="reduced").Q.T
+        q, r_mat = torch.linalg.qr(basis.T, mode="reduced")
+        diag_signs = torch.sign(torch.diag(r_mat))
+        diag_signs = torch.where(diag_signs == 0, torch.ones_like(diag_signs), diag_signs)
+        basis = (q * diag_signs.unsqueeze(0)).T
     return basis.contiguous()
 
 
 def oblique_weights(r: torch.Tensor, basis: torch.Tensor) -> tuple:
-    """Return normalized refusal direction and orthogonalized direction for capability preservation."""
+    """Return unit refusal direction and its unit orthogonal projection onto span(basis)^perp."""
     r_f = r.float()
     if r.is_meta or r.device.type == "meta":
         r_unit = r_f / r_f.norm().clamp_min(1e-8)
@@ -74,8 +98,8 @@ def apply_erasure(
     alpha: float = 1.0,
 ) -> torch.Tensor:
     """
-    Applies directional ablation along unit direction `w` (if provided and non-zero),
-    falling back to normalized `r`, on a 2D linear weight matrix W [out_features, in_features].
+    Applies rank-one directional ablation along unit direction `w` (falling back to `r`)
+    on a 2D linear weight matrix W [out_features, in_features].
     """
     device = W.device
     W_f32 = W.float().to(device)
@@ -91,13 +115,11 @@ def apply_erasure(
     out_features, in_features = W_f32.shape
     dim = u.shape[0]
 
-    # Residual stream in output space (e.g., o_proj, down_proj: [hidden, d_inner])
     if out_features == dim:
         proj = torch.mv(W_f32.T, u)
         delta = alpha * torch.outer(u, proj)
         return W_f32 - delta
 
-    # Residual stream in input space (e.g., q_proj, k_proj, v_proj, gate_proj, up_proj: [d_proj, hidden])
     if in_features == dim:
         proj = torch.mv(W_f32, u)
         delta = alpha * torch.outer(proj, u)
@@ -112,10 +134,7 @@ def apply_multi_direction_erasure(
     alpha: float = 1.0,
     decay_per_rank: float = 0.75,
 ) -> torch.Tensor:
-    """
-    Sequentially applies directional weight updates across a list of unit directions,
-    scaling subsequent directions by `decay_per_rank ** i` to keep updates controlled.
-    """
+    """Sequentially applies rank-one directional updates with geometric rank decay."""
     updated = W.float().to(W.device)
     if updated.ndim != 2 or not directions:
         return updated
@@ -129,10 +148,8 @@ def apply_multi_direction_erasure(
     return updated
 
 
-def preserve_row_norms(original_weight, updated_weight, eps: float = 1e-8):
-    """Rescale rows of updated_weight to match original_weight row norms (MPOA-style)."""
-    import torch
-
+def preserve_row_norms(original_weight: torch.Tensor, updated_weight: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
+    """Rescale rows of updated_weight to match original_weight row L2 norms."""
     orig_f = original_weight.float()
     upd_f = updated_weight.float()
     orig_norms = orig_f.norm(dim=-1, keepdim=True).clamp_min(eps)
