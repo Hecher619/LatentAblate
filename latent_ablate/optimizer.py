@@ -243,3 +243,4 @@ def compute_kernel_layer_weights(
         factor = math.exp(-0.5 * (dist / denom) ** 2)
         weights[layer] = round(lo_w + (hi_w - lo_w) * factor, 4)
     return weights
+

@@ -17,7 +17,6 @@ from latent_ablate.erasure import (
     apply_multi_direction_erasure,
     preserve_row_norms,
 )
-from latent_ablate.optimizer import compute_layer_weights
 
 logger = logging.getLogger("LatentAblate.Surgeon")
 
@@ -236,6 +235,8 @@ class LatentAblateSurgeon:
         target_energy: float = 0.85,
         conflict_scaling: bool = True,
     ):
+        from latent_ablate.optimizer import compute_layer_weights
+
         if target_components is None:
             target_components = ["attn", "mlp"]
 
