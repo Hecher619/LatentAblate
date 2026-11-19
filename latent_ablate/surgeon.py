@@ -225,6 +225,14 @@ class LatentAblateSurgeon:
 
                             if getattr(W_f32, "is_meta", False) or getattr(r_vec, "is_meta", False):
                                 continue
+                            _layers_ctx = locals().get("target_layers") or locals().get("layers") or []
+                            _cur_layer = locals().get("layer_idx") if isinstance(locals().get("layer_idx"), int) else locals().get("layer")
+                            if isinstance(_cur_layer, int) and isinstance(_layers_ctx, (list, tuple)) and len(_layers_ctx) > 1:
+                                _int_layers = [x for x in _layers_ctx if isinstance(x, int)]
+                                if _int_layers:
+                                    from latent_ablate.optimizer import compute_layer_weights
+                                    _layer_weights = compute_layer_weights(_int_layers, curve="cosine")
+                                    eff_alpha = eff_alpha * _layer_weights.get(_cur_layer, 1.0)
                             W_modified = apply_erasure(W_f32, r_vec, w_vec, eff_alpha)
                             W.copy_(W_modified.to(W.dtype))
 

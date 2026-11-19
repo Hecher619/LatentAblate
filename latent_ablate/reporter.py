@@ -41,3 +41,24 @@ class SurgeryReporter:
         logger.info(f"Audit report successfully saved to {report_path}")
 
 Reporter = SurgeryReporter
+
+
+def build_reproducibility_manifest(
+    model_path: str,
+    target_layers: list[int],
+    alpha_attn: float,
+    alpha_mlp: float,
+    curve: str = "cosine",
+    best_trial: dict | None = None,
+) -> dict:
+    """Create a structured reproducibility record for a surgical ablation run."""
+    return {
+        "schema_version": "1.0",
+        "tool": "LatentAblate",
+        "model_path": model_path,
+        "target_layers": list(target_layers),
+        "alpha_attn": float(alpha_attn),
+        "alpha_mlp": float(alpha_mlp),
+        "layer_curve": curve,
+        "best_trial": best_trial or {},
+    }

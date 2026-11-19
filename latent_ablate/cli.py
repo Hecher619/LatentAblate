@@ -1,3 +1,4 @@
+from latent_ablate.diagnostics import composite_trial_score
 import argparse
 import gc
 import logging
@@ -313,7 +314,11 @@ def interactive_trial_selector(trial_results: list) -> int:
 
     best_idx = min(
         range(len(trial_results)),
-        key=lambda i: (trial_results[i]["refusal"], trial_results[i]["perplexity"]),
+        key=lambda i: composite_trial_score(
+            refusal_rate=float(trial_results[i].get("refusal", 1.0)),
+            perplexity=float(trial_results[i].get("perplexity", 100.0)),
+            kl_divergence=float(trial_results[i].get("kl_divergence", 0.0)),
+        ),
     )
     return best_idx
 

@@ -127,3 +127,15 @@ def apply_multi_direction_erasure(
         updated = apply_erasure(updated, vec, w=vec, alpha=scaled_alpha)
 
     return updated
+
+
+def preserve_row_norms(original_weight, updated_weight, eps: float = 1e-8):
+    """Rescale rows of updated_weight to match original_weight row norms (MPOA-style)."""
+    import torch
+
+    orig_f = original_weight.float()
+    upd_f = updated_weight.float()
+    orig_norms = orig_f.norm(dim=-1, keepdim=True).clamp_min(eps)
+    upd_norms = upd_f.norm(dim=-1, keepdim=True).clamp_min(eps)
+    scaled = upd_f * (orig_norms / upd_norms)
+    return scaled.to(original_weight.dtype)
