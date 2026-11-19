@@ -82,6 +82,8 @@ def apply_erasure(
     if W_f32.ndim != 2:
         return W_f32
 
+    if getattr(W, "is_meta", False) or getattr(r, "is_meta", False) or (w is not None and getattr(w, "is_meta", False)):
+        return W
     target_vec = w if (w is not None and w.numel() > 0 and w.norm().item() > 1e-8) else r
     u = target_vec.to(device).float()
     u = u / u.norm().clamp_min(1e-8)
