@@ -6,24 +6,36 @@ logger = logging.getLogger("LatentAblate.Erasure")
 ORTHO_FALLBACK = 1e-3
 
 
+def _is_meta(tensor: torch.Tensor | None) -> bool:
+    if tensor is None:
+        return False
+    if getattr(tensor, "is_meta", False):
+        return True
+    dev = getattr(tensor, "device", None)
+    return dev is not None and getattr(dev, "type", None) == "meta"
+
+
 def conflict_score(r: torch.Tensor, basis: torch.Tensor) -> float:
     """Fraction of ||r||_2 that lies inside the capability subspace span(basis)."""
-    if basis is None or basis.numel() == 0 or r.is_meta:
+    if basis is None or basis.numel() == 0 or _is_meta(r) or _is_meta(basis):
         return 0.0
     device = r.device
-    if device.type == "meta":
-        return 0.0
     r = r.to(device).float()
     r_unit = r / r.norm().clamp_min(1e-8)
     basis = basis.to(device).float()
     if basis.ndim == 1:
         basis = basis.unsqueeze(0)
     proj = basis.T @ (basis @ r_unit)
-    return float((proj.norm() / r_unit.norm().clamp_min(1e-8)).item())
+    out = proj.norm() / r_unit.norm().clamp_min(1e-8)
+    if _is_meta(out):
+        return 0.0
+    return float(out.item())
 
 
 def explained_variance_ratio(activations: torch.Tensor, rank: int) -> float:
     """Fraction of centered activation variance captured by the top `rank` singular vectors."""
+    if _is_meta(activations):
+        return 0.0
     acts = activations.float()
     if acts.shape[0] < 2:
         return 1.0
@@ -32,7 +44,10 @@ def explained_variance_ratio(activations: torch.Tensor, rank: int) -> float:
     total_energy = (svals ** 2).sum().clamp_min(1e-12)
     k = max(1, min(rank, svals.shape[0]))
     captured = (svals[:k] ** 2).sum()
-    return float((captured / total_energy).item())
+    ratio = captured / total_energy
+    if _is_meta(ratio):
+        return 0.0
+    return float(ratio.item())
 
 
 def select_energy_rank(
@@ -43,7 +58,7 @@ def select_energy_rank(
 ) -> int:
     """Selects the smallest rank k in [1, max_rank] reaching `target_energy` of centered contrast variance."""
     cap_max = max(1, int(max_rank))
-    if pos_activations is None or neg_activations is None:
+    if pos_activations is None or neg_activations is None or _is_meta(pos_activations) or _is_meta(neg_activations):
         return 1
     n_pairs = min(pos_activations.shape[0], neg_activations.shape[0])
     if n_pairs < 2:
@@ -52,18 +67,19 @@ def select_energy_rank(
     diff = pos_activations[:n_pairs].float() - neg_activations[:n_pairs].float()
     centered = diff - diff.mean(dim=0, keepdim=True)
     svals = torch.linalg.svdvals(centered)
-    if svals.numel() == 0:
+    if svals.numel() == 0 or _is_meta(svals):
         return 1
 
     energies = svals ** 2
     total = energies.sum()
-    if total <= 1e-12:
+    if _is_meta(total) or total <= 1e-12:
         return 1
 
     cum_ratio = torch.cumsum(energies, dim=0) / total
     upper = min(cap_max, cum_ratio.shape[0])
     for idx in range(upper):
-        if float(cum_ratio[idx].item()) >= float(target_energy):
+        item_val = cum_ratio[idx]
+        if not _is_meta(item_val) and float(item_val.item()) >= float(target_energy):
             return idx + 1
     return upper
 
@@ -77,6 +93,10 @@ def conflict_scaled_alpha(base_alpha: float, c_score: float, sensitivity: float 
 
 def build_capability_basis(activations: torch.Tensor, rank: int = 16) -> torch.Tensor:
     """Sign-deterministic orthonormal basis of dominant representation directions on capability prompts."""
+    if _is_meta(activations):
+        hidden = activations.shape[-1] if activations.ndim >= 1 else 0
+        return torch.empty(0, hidden, dtype=torch.float32)
+
     acts = activations.float()
     if acts.shape[0] < 2:
         raise ValueError("Need >= 2 capability activations to build a basis.")
@@ -93,11 +113,13 @@ def build_capability_basis(activations: torch.Tensor, rank: int = 16) -> torch.T
 
     k = max(1, min(rank, vh.shape[0]))
     total_energy = (svals ** 2).sum().clamp_min(1e-12)
-    captured_ratio = float(((svals[:k] ** 2).sum() / total_energy).item())
-    if captured_ratio < 0.70:
-        logger.debug(
-            f"Capability basis rank={k} captures {captured_ratio * 100:.1f}% of variance; consider increasing rank."
-        )
+    ratio_tensor = (svals[:k] ** 2).sum() / total_energy
+    if not _is_meta(ratio_tensor):
+        captured_ratio = float(ratio_tensor.item())
+        if captured_ratio < 0.70:
+            logger.debug(
+                f"Capability basis rank={k} captures {captured_ratio * 100:.1f}% of variance; consider increasing rank."
+            )
 
     basis = vh[:k].to(device)
     if basis.shape[0] > 0:
@@ -111,7 +133,7 @@ def build_capability_basis(activations: torch.Tensor, rank: int = 16) -> torch.T
 def oblique_weights(r: torch.Tensor, basis: torch.Tensor) -> tuple:
     """Return unit refusal direction and its unit orthogonal projection onto span(basis)^perp."""
     r_f = r.float()
-    if r.is_meta or r.device.type == "meta":
+    if _is_meta(r):
         r_unit = r_f / r_f.norm().clamp_min(1e-8)
         return r_unit, r_unit
 
@@ -119,13 +141,13 @@ def oblique_weights(r: torch.Tensor, basis: torch.Tensor) -> tuple:
     r_f = r_f.to(device)
     r_unit = r_f / r_f.norm().clamp_min(1e-8)
 
-    if basis is not None and basis.numel() > 0 and not basis.is_meta and basis.device.type != "meta":
+    if basis is not None and basis.numel() > 0 and not _is_meta(basis):
         b = basis.to(device).float()
         if b.ndim == 1:
             b = b.unsqueeze(0)
         r_perp = r_unit - b.T @ (b @ r_unit)
         norm_perp = r_perp.norm()
-        if norm_perp > ORTHO_FALLBACK:
+        if not _is_meta(norm_perp) and norm_perp > ORTHO_FALLBACK:
             return r_unit, r_perp / norm_perp
 
     return r_unit, r_unit
@@ -141,14 +163,16 @@ def apply_erasure(
     Applies rank-one directional ablation along unit direction `w` (falling back to `r`)
     on a 2D linear weight matrix W [out_features, in_features].
     """
+    if _is_meta(W) or _is_meta(r) or _is_meta(w):
+        return W
+
     device = W.device
     W_f32 = W.float().to(device)
     if W_f32.ndim != 2:
         return W_f32
 
-    if getattr(W, "is_meta", False) or getattr(r, "is_meta", False) or (w is not None and getattr(w, "is_meta", False)):
-        return W
-    target_vec = w if (w is not None and w.numel() > 0 and w.norm().item() > 1e-8) else r
+    use_w = w is not None and w.numel() > 0 and not _is_meta(w) and float(w.norm().item()) > 1e-8
+    target_vec = w if use_w else r
     u = target_vec.to(device).float()
     u = u / u.norm().clamp_min(1e-8)
 
@@ -175,12 +199,14 @@ def apply_multi_direction_erasure(
     decay_per_rank: float = 0.75,
 ) -> torch.Tensor:
     """Sequentially applies rank-one directional updates with geometric rank decay."""
+    if _is_meta(W):
+        return W
     updated = W.float().to(W.device)
     if updated.ndim != 2 or not directions:
         return updated
 
     for idx, vec in enumerate(directions):
-        if vec is None or vec.numel() == 0:
+        if vec is None or vec.numel() == 0 or _is_meta(vec):
             continue
         scaled_alpha = alpha * (decay_per_rank ** idx)
         updated = apply_erasure(updated, vec, w=vec, alpha=scaled_alpha)
@@ -190,6 +216,8 @@ def apply_multi_direction_erasure(
 
 def preserve_row_norms(original_weight: torch.Tensor, updated_weight: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
     """Rescale rows of updated_weight to match original_weight row L2 norms."""
+    if _is_meta(original_weight) or _is_meta(updated_weight):
+        return updated_weight
     orig_f = original_weight.float()
     upd_f = updated_weight.float()
     orig_norms = orig_f.norm(dim=-1, keepdim=True).clamp_min(eps)

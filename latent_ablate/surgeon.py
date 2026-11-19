@@ -21,6 +21,15 @@ from latent_ablate.erasure import (
 logger = logging.getLogger("LatentAblate.Surgeon")
 
 
+def _is_meta_tensor(t) -> bool:
+    if t is None:
+        return False
+    if getattr(t, "is_meta", False):
+        return True
+    dev = getattr(t, "device", None)
+    return dev is not None and getattr(dev, "type", None) == "meta"
+
+
 class LatentAblateSurgeon:
     def __init__(
         self,
@@ -289,8 +298,12 @@ class LatentAblateSurgeon:
                 else:
                     subspace_vecs = r.unsqueeze(0)
 
+                cap = None
                 if preserve_capability and capability_prompts and len(capability_prompts) >= 2:
-                    cap = self.extractor.extract_hidden_states(capability_prompts, idx).to(layer_device)
+                    cap = self.extractor.extract_hidden_states(capability_prompts, idx)
+
+                if cap is not None and not _is_meta_tensor(cap):
+                    cap = cap.to(layer_device)
                     cap_basis_attn = build_capability_basis(cap, rank=basis_rank_attn).to(layer_device)
                     cap_basis_mlp = build_capability_basis(cap, rank=basis_rank_mlp).to(layer_device)
                 else:
@@ -353,7 +366,7 @@ class LatentAblateSurgeon:
                         else:
                             W_f32 = W.float().to(w_dev)
 
-                        if getattr(W_f32, "is_meta", False) or getattr(r_vec, "is_meta", False):
+                        if _is_meta_tensor(W_f32) or _is_meta_tensor(r_vec):
                             continue
 
                         if len(multi_dirs) > 1:
