@@ -7,7 +7,14 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 from latent_ablate.arch import resolve_layers, hidden_size, eligible_linears
 from latent_ablate.extractor import ActivationExtractor
 from latent_ablate.subspace import refusal_direction
-from latent_ablate.erasure import conflict_score, build_capability_basis, oblique_weights, apply_erasure
+from latent_ablate.erasure import (
+    conflict_score,
+    build_capability_basis,
+    oblique_weights,
+    apply_erasure,
+    preserve_row_norms,
+)
+from latent_ablate.optimizer import compute_layer_weights
 
 logger = logging.getLogger("LatentAblate.Surgeon")
 
@@ -110,7 +117,11 @@ class LatentAblateSurgeon:
         scaling_factor: float = 1.15,
         target_components: list = None,
         preserve_capability: bool = True,
+        calibrate_norms: bool = True,
+        layer_curve: str = "cosine",
+        all_layers: bool = False,
     ):
+        effective_window = len(self.layers) if all_layers else layer_window
         passes = [
             {
                 "name": f"Layer_{target_layer_idx}_Pass",
@@ -122,13 +133,65 @@ class LatentAblateSurgeon:
         return self.execute_multi_pass_surgery(
             passes=passes,
             capability_prompts=capability_prompts,
-            layer_window=layer_window,
+            layer_window=effective_window,
             basis_rank_attn=basis_rank,
             basis_rank_mlp=max(4, basis_rank // 2),
             scaling_factor_attn=scaling_factor,
             scaling_factor_mlp=scaling_factor,
             target_components=target_components,
             preserve_capability=preserve_capability,
+            calibrate_norms=calibrate_norms,
+            layer_curve=layer_curve,
+        )
+
+    def execute_full_stack_surgery(
+        self,
+        positive_prompts: list,
+        negative_prompts: list,
+        capability_prompts: list,
+        tier_specs: list[tuple[int, int, float]] | None = None,
+        basis_rank_attn: int = 16,
+        basis_rank_mlp: int = 12,
+        target_components: list = None,
+        preserve_capability: bool = True,
+        calibrate_norms: bool = True,
+        layer_curve: str = "cosine",
+    ):
+        """
+        Stacks multiple layer-band passes from early-mid to late layers with gentle
+        per-tier scaling so refusal directions across depths are covered cleanly.
+        """
+        n_layers = len(self.layers)
+        if tier_specs is None:
+            tier_specs = [
+                (max(1, int(n_layers * 0.35)), max(2, n_layers // 8), 0.55),
+                (max(1, int(n_layers * 0.55)), max(2, n_layers // 6), 0.85),
+                (max(1, int(n_layers * 0.75)), max(2, n_layers // 8), 0.50),
+            ]
+
+        passes = []
+        for idx, (center_layer, window, alpha) in enumerate(tier_specs):
+            clamped = max(0, min(n_layers - 1, center_layer))
+            passes.append({
+                "name": f"StackTier_{idx+1}_L{clamped}",
+                "positive": positive_prompts,
+                "negative": negative_prompts,
+                "target_layer": clamped,
+                "layer_window": window,
+                "alpha_attn": alpha,
+                "alpha_mlp": alpha * 0.85,
+            })
+
+        return self.execute_multi_pass_surgery(
+            passes=passes,
+            capability_prompts=capability_prompts,
+            layer_window=max(2, n_layers // 6),
+            basis_rank_attn=basis_rank_attn,
+            basis_rank_mlp=basis_rank_mlp,
+            target_components=target_components,
+            preserve_capability=preserve_capability,
+            calibrate_norms=calibrate_norms,
+            layer_curve=layer_curve,
         )
 
     def execute_multi_pass_surgery(
@@ -142,6 +205,8 @@ class LatentAblateSurgeon:
         scaling_factor_mlp: float = 1.15,
         target_components: list = None,
         preserve_capability: bool = True,
+        calibrate_norms: bool = True,
+        layer_curve: str = "cosine",
     ):
         if target_components is None:
             target_components = ["attn", "mlp"]
@@ -153,15 +218,20 @@ class LatentAblateSurgeon:
             pos_prompts = pass_data.get("positive", [])
             neg_prompts = pass_data.get("negative", [])
             target_layer_idx = pass_data.get("target_layer", len(self.layers) // 2)
+            pass_window = pass_data.get("layer_window", layer_window)
+            pass_alpha_attn = pass_data.get("alpha_attn", scaling_factor_attn)
+            pass_alpha_mlp = pass_data.get("alpha_mlp", scaling_factor_mlp)
 
             logger.info(
                 f"=== Starting Surgical Pass [{pass_idx+1}/{len(passes)}]: {pass_name} at Layer {target_layer_idx} ==="
             )
 
-            start = max(0, target_layer_idx - layer_window)
-            end = min(len(self.layers) - 1, target_layer_idx + layer_window)
+            start = max(0, target_layer_idx - pass_window)
+            end = min(len(self.layers) - 1, target_layer_idx + pass_window)
+            window_indices = list(range(start, end + 1))
+            layer_multipliers = compute_layer_weights(window_indices, curve=layer_curve)
 
-            for idx in tqdm(range(start, end + 1), desc=f"Pass '{pass_name}' Layers"):
+            for idx in tqdm(window_indices, desc=f"Pass '{pass_name}' Layers"):
                 if idx in modified_layers:
                     continue
                 modified_layers.add(idx)
@@ -188,10 +258,11 @@ class LatentAblateSurgeon:
                 self.conflict_table[f"{pass_name}_layer_{idx}"] = conflict
 
                 distance_from_peak = abs(idx - target_layer_idx)
-                gaussian_weight = math.exp(-0.10 * (distance_from_peak / max(1, layer_window)) ** 2)
+                gaussian_weight = math.exp(-0.10 * (distance_from_peak / max(1, pass_window)) ** 2)
+                curve_mult = layer_multipliers.get(idx, 1.0)
 
-                alpha_attn = scaling_factor_attn * max(gaussian_weight, 0.85)
-                alpha_mlp = scaling_factor_mlp * max(gaussian_weight, 0.85)
+                alpha_attn = pass_alpha_attn * max(gaussian_weight, 0.85) * curve_mult
+                alpha_mlp = pass_alpha_mlp * max(gaussian_weight, 0.85) * curve_mult
 
                 r_attn_unit, w_attn = oblique_weights(r, cap_basis_attn)
                 r_mlp_unit, w_mlp = oblique_weights(r, cap_basis_mlp)
@@ -223,18 +294,23 @@ class LatentAblateSurgeon:
                         else:
                             W_f32 = W.float().to(w_dev)
 
-                            if getattr(W_f32, "is_meta", False) or getattr(r_vec, "is_meta", False):
-                                continue
-                            _layers_ctx = locals().get("target_layers") or locals().get("layers") or []
-                            _cur_layer = locals().get("layer_idx") if isinstance(locals().get("layer_idx"), int) else locals().get("layer")
-                            if isinstance(_cur_layer, int) and isinstance(_layers_ctx, (list, tuple)) and len(_layers_ctx) > 1:
-                                _int_layers = [x for x in _layers_ctx if isinstance(x, int)]
-                                if _int_layers:
-                                    from latent_ablate.optimizer import compute_layer_weights
-                                    _layer_weights = compute_layer_weights(_int_layers, curve="cosine")
-                                    eff_alpha = eff_alpha * _layer_weights.get(_cur_layer, 1.0)
-                            W_modified = apply_erasure(W_f32, r_vec, w_vec, eff_alpha)
-                            W.copy_(W_modified.to(W.dtype))
+                        if getattr(W_f32, "is_meta", False) or getattr(r_vec, "is_meta", False):
+                            continue
+
+                        W_modified = apply_erasure(W_f32, r_vec, w_vec, eff_alpha)
+                        if calibrate_norms:
+                            W_modified = preserve_row_norms(W_f32, W_modified)
+
+                        if is_quantized:
+                            logger.warning(
+                                f"Quantized tensor '{name}' modified in float32; save_pretrained may require unquantized weights for full persistence."
+                            )
+                            try:
+                                W.copy_(W_modified.to(dtype=W.dtype, device=w_dev))
+                            except Exception:
+                                logger.debug(f"Could not copy directly into quantized storage for '{name}'.")
+                        else:
+                            W.copy_(W_modified.to(dtype=W.dtype, device=w_dev))
 
         logger.info("All directional ablation operations successfully completed.")
 
