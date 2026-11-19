@@ -2,7 +2,7 @@
 
 A local command-line toolkit for directional weight modification, trial sweeps, evaluation scoring, and interactive inspection of decoder-only causal language models.
 
-Runs locally on your own hardware with no cloud lock-in or telemetry[span_1](start_span)[span_1](end_span).
+Runs locally on your own hardware with no cloud lock-in or telemetry
 
  How It Works
 
