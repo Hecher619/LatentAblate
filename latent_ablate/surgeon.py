@@ -223,10 +223,10 @@ class LatentAblateSurgeon:
                         else:
                             W_f32 = W.float().to(w_dev)
 
-                        if getattr(W_f32, "is_meta", False) or getattr(r_vec, "is_meta", False):
-                    continue
-                W_modified = apply_erasure(W_f32, r_vec, w_vec, eff_alpha)
-                        W.copy_(W_modified.to(W.dtype))
+                            if getattr(W_f32, "is_meta", False) or getattr(r_vec, "is_meta", False):
+                                continue
+                            W_modified = apply_erasure(W_f32, r_vec, w_vec, eff_alpha)
+                            W.copy_(W_modified.to(W.dtype))
 
         logger.info("All directional ablation operations successfully completed.")
 
