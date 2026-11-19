@@ -1,4 +1,3 @@
-from latent_ablate.diagnostics import composite_trial_score
 import argparse
 import gc
 import logging
@@ -17,8 +16,9 @@ except ImportError:
 
 from latent_ablate.adversarial import AdversarialStressTester
 from latent_ablate.arch import eligible_linears, resolve_layers
-from latent_ablate.diagnostics import measure_layer_delta
+from latent_ablate.diagnostics import composite_trial_score, measure_layer_delta
 from latent_ablate.erasure import apply_multi_direction_erasure
+from latent_ablate.guardrail import CapabilityGuardrail
 from latent_ablate.optimizer import SubspaceOptimizer
 from latent_ablate.plugins.scorer import Context, RefusalSuppressionScorer, UtilityPerplexityScorer
 from latent_ablate.profiles import BehaviorProfiles
@@ -26,8 +26,11 @@ from latent_ablate.prompts import PromptLoader
 from latent_ablate.publisher import HuggingFacePublisher
 from latent_ablate.refusal_subspace import RefusalSubspaceExtractor
 from latent_ablate.reporter import SurgeryReporter
+from latent_ablate.scope import AblateScope
 from latent_ablate.snapshot import LayerWeightSnapshot
 from latent_ablate.surgeon import LatentAblateSurgeon
+from latent_ablate.sweeper import LayerSweeper
+from latent_ablate.validator import ModelValidator
 
 logger = logging.getLogger("LatentAblate.CLI")
 
@@ -77,6 +80,30 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Run stacked multi-tier passes across early-mid, mid, and late layers with tapered scaling.",
     )
+    p.add_argument(
+        "--subspace-rank",
+        type=int,
+        default=1,
+        help="Rank k (>1) for multi-directional refusal subspace ablation via SVD.",
+    )
+    p.add_argument(
+        "--auto-sweep",
+        action="store_true",
+        help="Scan layers with LayerSweeper before surgery to detect the refusal manifold peak.",
+    )
+    p.add_argument(
+        "--guardrail",
+        action="store_true",
+        help="Enable CapabilityGuardrail automatic rollback if perplexity increases beyond threshold.",
+    )
+    p.add_argument(
+        "--max-ppl-increase",
+        type=float,
+        default=25.0,
+        help="Maximum allowed percentage perplexity increase when --guardrail is enabled.",
+    )
+    p.add_argument("--scope-out", type=str, default=None, help="Export AblateScope .latentspec.json profile before surgery.")
+    p.add_argument("--scope-in", type=str, default=None, help="Load an AblateScope .latentspec.json profile to set layer/alpha.")
     p.add_argument("--trials", type=int, default=1, help="Number of trial iterations.")
     p.add_argument("--optimize", action="store_true", help="Enable automated Optuna TPE optimization.")
     p.add_argument("--target-layers", type=str, default="18", help="Comma-separated transformer layer indices.")
@@ -368,6 +395,8 @@ def main(argv=None):
             args.alpha_mlp = surgery_cfg.get("alpha_mlp", args.alpha_mlp)
         if "--full-stack" not in raw_argv:
             args.full_stack = bool(surgery_cfg.get("full_stack", args.full_stack))
+        if "--subspace-rank" not in raw_argv:
+            args.subspace_rank = int(surgery_cfg.get("subspace_rank", args.subspace_rank))
 
         datasets_cfg = config_data.get("datasets", {})
         profile_name = datasets_cfg.get("profile", profile_name)
@@ -398,6 +427,17 @@ def main(argv=None):
     trial_records = []
     target_layers_list = [int(x.strip()) for x in args.target_layers.split(",") if x.strip().isdigit()]
 
+    if args.scope_in:
+        spec = AblateScope.load_spec(args.scope_in)
+        rec_layer = spec.get("recommended_layer")
+        rec_alpha = spec.get("recommended_alpha")
+        if rec_layer is not None:
+            target_layers_list = [int(rec_layer)]
+        if rec_alpha is not None:
+            args.alpha_attn = float(rec_alpha)
+            args.alpha_mlp = round(float(rec_alpha) * 0.9, 4)
+        logger.info(f"Loaded AblateScope spec from {args.scope_in}: layer={target_layers_list}, alpha={args.alpha_attn}")
+
     if args.optimize:
         logger.info("Running Optuna Hyperparameter Optimization...")
         try:
@@ -423,7 +463,8 @@ def main(argv=None):
 
     logger.info(
         f"Starting multi-pass surgical execution across layers {target_layers_list} "
-        f"(full_stack={args.full_stack}, alpha_attn={args.alpha_attn:.2f}, alpha_mlp={args.alpha_mlp:.2f})..."
+        f"(full_stack={args.full_stack}, subspace_rank={args.subspace_rank}, "
+        f"alpha_attn={args.alpha_attn:.2f}, alpha_mlp={args.alpha_mlp:.2f})..."
     )
 
     for trial in range(1, args.trials + 1):
@@ -437,6 +478,34 @@ def main(argv=None):
             torch_dtype=torch.float16,
             local_files_only=args.local_only,
         )
+
+        if args.scope_out and trial == 1:
+            scope_report = AblateScope.map_layers(
+                surgeon.model,
+                surgeon.tokenizer,
+                surgeon.device,
+                pos,
+                neg,
+                capability_prompts=BehaviorProfiles.CAPABILITY_PROMPTS,
+                basis_rank=args.basis_rank_attn,
+            )
+            AblateScope.save_spec(scope_report, args.scope_out)
+            if "--target-layers" not in raw_argv and not args.scope_in:
+                target_layers_list = [int(scope_report["recommended_layer"])]
+
+        if args.auto_sweep and trial == 1:
+            sweeper = LayerSweeper(surgeon.model, surgeon.tokenizer, surgeon.device)
+            peak_layer = sweeper.find_optimal_layer(pos, neg, output_dir=args.output_dir)
+            target_layers_list = [peak_layer]
+            reporter.log_step("auto_sweep_peak", {"peak_layer": peak_layer})
+
+        baseline_ppl = None
+        param_snapshot = None
+        if args.guardrail:
+            baseline_ppl = ModelValidator.calculate_perplexity(
+                surgeon.model, surgeon.tokenizer, BehaviorProfiles.CAPABILITY_PROMPTS, surgeon.device
+            )
+            param_snapshot = CapabilityGuardrail.snapshot_parameters(surgeon.model)
 
         max_layer = len(surgeon.layers) - 1
         valid_layers = [l for l in target_layers_list if 0 <= l <= max_layer]
@@ -460,6 +529,7 @@ def main(argv=None):
                 target_components=["attn", "mlp"],
                 preserve_capability=True,
                 calibrate_norms=True,
+                subspace_rank=args.subspace_rank,
             )
         else:
             passes = [
@@ -483,7 +553,20 @@ def main(argv=None):
                 target_components=["attn", "mlp"],
                 preserve_capability=True,
                 calibrate_norms=True,
+                subspace_rank=args.subspace_rank,
             )
+
+        if args.guardrail:
+            passed_guardrail = CapabilityGuardrail.validate_and_rollback(
+                surgeon.model,
+                surgeon.tokenizer,
+                surgeon.device,
+                baseline_ppl=baseline_ppl,
+                capability_texts=BehaviorProfiles.CAPABILITY_PROMPTS,
+                max_ppl_increase_pct=args.max_ppl_increase,
+                snapshot=param_snapshot,
+            )
+            reporter.log_step(f"trial_{trial}_guardrail", {"passed": passed_guardrail})
 
         ctx = Context(
             model=surgeon.model,

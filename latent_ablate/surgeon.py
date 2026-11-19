@@ -6,12 +6,13 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from latent_ablate.arch import resolve_layers, hidden_size, eligible_linears
 from latent_ablate.extractor import ActivationExtractor
-from latent_ablate.subspace import refusal_direction
+from latent_ablate.subspace import SubspaceIsolator, refusal_direction
 from latent_ablate.erasure import (
     conflict_score,
     build_capability_basis,
     oblique_weights,
     apply_erasure,
+    apply_multi_direction_erasure,
     preserve_row_norms,
 )
 from latent_ablate.optimizer import compute_layer_weights
@@ -120,6 +121,8 @@ class LatentAblateSurgeon:
         calibrate_norms: bool = True,
         layer_curve: str = "cosine",
         all_layers: bool = False,
+        subspace_rank: int = 1,
+        rank_decay: float = 0.75,
     ):
         effective_window = len(self.layers) if all_layers else layer_window
         passes = [
@@ -142,6 +145,8 @@ class LatentAblateSurgeon:
             preserve_capability=preserve_capability,
             calibrate_norms=calibrate_norms,
             layer_curve=layer_curve,
+            subspace_rank=subspace_rank,
+            rank_decay=rank_decay,
         )
 
     def execute_full_stack_surgery(
@@ -156,6 +161,8 @@ class LatentAblateSurgeon:
         preserve_capability: bool = True,
         calibrate_norms: bool = True,
         layer_curve: str = "cosine",
+        subspace_rank: int = 1,
+        rank_decay: float = 0.75,
     ):
         """
         Stacks multiple layer-band passes from early-mid to late layers with gentle
@@ -192,6 +199,8 @@ class LatentAblateSurgeon:
             preserve_capability=preserve_capability,
             calibrate_norms=calibrate_norms,
             layer_curve=layer_curve,
+            subspace_rank=subspace_rank,
+            rank_decay=rank_decay,
         )
 
     def execute_multi_pass_surgery(
@@ -207,11 +216,14 @@ class LatentAblateSurgeon:
         preserve_capability: bool = True,
         calibrate_norms: bool = True,
         layer_curve: str = "cosine",
+        subspace_rank: int = 1,
+        rank_decay: float = 0.75,
     ):
         if target_components is None:
             target_components = ["attn", "mlp"]
 
         modified_layers = set()
+        effective_subspace_rank = max(1, int(subspace_rank))
 
         for pass_idx, pass_data in enumerate(passes):
             pass_name = pass_data.get("name", f"Pass_{pass_idx+1}")
@@ -246,6 +258,13 @@ class LatentAblateSurgeon:
                 neg = self.extractor.extract_hidden_states(neg_prompts, idx).to(layer_device)
                 r = refusal_direction(pos, neg).to(layer_device)
 
+                if effective_subspace_rank > 1 and pos.shape[0] == neg.shape[0] and pos.shape[0] >= 2:
+                    subspace_vecs = SubspaceIsolator.compute_refusal_subspace(
+                        pos, neg, rank=effective_subspace_rank
+                    ).to(layer_device)
+                else:
+                    subspace_vecs = r.unsqueeze(0)
+
                 if preserve_capability and capability_prompts and len(capability_prompts) >= 2:
                     cap = self.extractor.extract_hidden_states(capability_prompts, idx).to(layer_device)
                     cap_basis_attn = build_capability_basis(cap, rank=basis_rank_attn).to(layer_device)
@@ -267,6 +286,13 @@ class LatentAblateSurgeon:
                 r_attn_unit, w_attn = oblique_weights(r, cap_basis_attn)
                 r_mlp_unit, w_mlp = oblique_weights(r, cap_basis_mlp)
 
+                ortho_dirs_attn = [
+                    oblique_weights(vec, cap_basis_attn)[1] for vec in subspace_vecs
+                ]
+                ortho_dirs_mlp = [
+                    oblique_weights(vec, cap_basis_mlp)[1] for vec in subspace_vecs
+                ]
+
                 with torch.no_grad():
                     for name, W, comp_type in targets:
                         w_dev = W.device
@@ -275,10 +301,12 @@ class LatentAblateSurgeon:
                             eff_alpha = alpha_attn
                             r_vec = r_attn_unit.to(w_dev)
                             w_vec = w_attn.to(w_dev)
+                            multi_dirs = [d.to(w_dev) for d in ortho_dirs_attn]
                         else:
                             eff_alpha = alpha_mlp
                             r_vec = r_mlp_unit.to(w_dev)
                             w_vec = w_mlp.to(w_dev)
+                            multi_dirs = [d.to(w_dev) for d in ortho_dirs_mlp]
 
                         is_quantized = (
                             getattr(W, "is_quantized", False)
@@ -297,7 +325,13 @@ class LatentAblateSurgeon:
                         if getattr(W_f32, "is_meta", False) or getattr(r_vec, "is_meta", False):
                             continue
 
-                        W_modified = apply_erasure(W_f32, r_vec, w_vec, eff_alpha)
+                        if len(multi_dirs) > 1:
+                            W_modified = apply_multi_direction_erasure(
+                                W_f32, multi_dirs, alpha=eff_alpha, decay_per_rank=rank_decay
+                            )
+                        else:
+                            W_modified = apply_erasure(W_f32, r_vec, w_vec, eff_alpha)
+
                         if calibrate_norms:
                             W_modified = preserve_row_norms(W_f32, W_modified)
 

@@ -1,9 +1,15 @@
 import torch
-import torch.nn as nn
 
 from latent_ablate.cli import build_parser
-from latent_ablate.erasure import apply_erasure, build_capability_basis, oblique_weights, preserve_row_norms
-from latent_ablate.optimizer import compute_layer_weights, compute_kernel_layer_weights
+from latent_ablate.erasure import (
+    apply_erasure,
+    build_capability_basis,
+    explained_variance_ratio,
+    oblique_weights,
+    preserve_row_norms,
+)
+from latent_ablate.optimizer import compute_kernel_layer_weights, compute_layer_weights
+from latent_ablate.riemannian_steering import RiemannianGeodesicEngine
 from latent_ablate.scope import AblateScope
 
 
@@ -17,6 +23,18 @@ def test_preserve_row_norms_keeps_row_magnitude():
     assert torch.allclose(orig_norms, cal_norms, atol=1e-5)
 
 
+def test_capability_basis_is_orthonormal_and_tracks_variance():
+    torch.manual_seed(0)
+    cap_acts = torch.randn(16, 64)
+    basis = build_capability_basis(cap_acts, rank=6)
+    gram = basis @ basis.T
+    assert torch.allclose(gram, torch.eye(6), atol=1e-5)
+
+    ev_small = explained_variance_ratio(cap_acts, rank=2)
+    ev_large = explained_variance_ratio(cap_acts, rank=10)
+    assert 0.0 < ev_small <= ev_large <= 1.0
+
+
 def test_oblique_weights_reduces_capability_overlap():
     torch.manual_seed(0)
     cap_acts = torch.randn(12, 64)
@@ -27,6 +45,17 @@ def test_oblique_weights_reduces_capability_overlap():
     proj_before = (basis.T @ (basis @ (r / r.norm()))).norm().item()
     proj_after = (basis.T @ (basis @ w_ortho)).norm().item()
     assert proj_after <= proj_before + 1e-5
+
+
+def test_spherical_geodesic_transport_preserves_row_norms():
+    h = torch.randn(8, 32)
+    v = torch.randn(32)
+    transported = RiemannianGeodesicEngine.spherical_geodesic_transport(h, v, step_size=0.35)
+    assert torch.allclose(h.norm(dim=-1), transported.norm(dim=-1), atol=1e-5)
+
+    basis = torch.randn(4, 32)
+    inv_gram = RiemannianGeodesicEngine.regularized_gram_inverse(basis)
+    assert inv_gram.shape == (4, 4)
 
 
 def test_apply_erasure_modifies_matching_linear():
@@ -46,16 +75,24 @@ def test_layer_weight_curves():
     assert kernel_w[12] >= kernel_w[10]
 
 
-def test_cli_full_stack_and_mpoa_flags():
+def test_cli_flags_and_scope_roundtrip(tmp_path):
     parser = build_parser()
-    args = parser.parse_args(["--modifier", "mpoa", "--full-stack"])
+    args = parser.parse_args([
+        "--modifier", "mpoa",
+        "--full-stack",
+        "--subspace-rank", "3",
+        "--auto-sweep",
+        "--guardrail",
+        "--scope-out", str(tmp_path / "spec.json"),
+    ])
     assert args.modifier == "mpoa"
     assert args.full_stack is True
+    assert args.subspace_rank == 3
+    assert args.auto_sweep is True
+    assert args.guardrail is True
 
-
-def test_ablate_scope_spec_roundtrip(tmp_path):
     spec = {
-        "schema": "LatentScopeSpec/1.0",
+        "schema": "LatentScopeSpec/1.1",
         "total_layers": 24,
         "recommended_layer": 14,
         "recommended_alpha": 0.95,
