@@ -66,7 +66,17 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--model-path", default="Qwen/Qwen2.5-1.5B-Instruct", help="Model path or HF repo ID.")
     p.add_argument("--local-only", action="store_true", help="Load models and tokenizers strictly from local cache/disk.")
     p.add_argument("--output-dir", default="./out/liberated_model", help="Output directory.")
-    p.add_argument("--modifier", choices=["cwoe", "ara", "soma", "riemannian", "sae"], default="cwoe", help="Modification engine.")
+    p.add_argument(
+        "--modifier",
+        choices=["mpoa", "cwoe", "ara", "soma", "riemannian", "sae"],
+        default="mpoa",
+        help="Modification engine.",
+    )
+    p.add_argument(
+        "--full-stack",
+        action="store_true",
+        help="Run stacked multi-tier passes across early-mid, mid, and late layers with tapered scaling.",
+    )
     p.add_argument("--trials", type=int, default=1, help="Number of trial iterations.")
     p.add_argument("--optimize", action="store_true", help="Enable automated Optuna TPE optimization.")
     p.add_argument("--target-layers", type=str, default="18", help="Comma-separated transformer layer indices.")
@@ -315,7 +325,7 @@ def interactive_trial_selector(trial_results: list) -> int:
     best_idx = min(
         range(len(trial_results)),
         key=lambda i: composite_trial_score(
-            refusal_rate=float(trial_results[i].get("refusal", 1.0)),
+            refusal_rate=float(trial_results[i].get("refusal", 100.0)) / 100.0,
             perplexity=float(trial_results[i].get("perplexity", 100.0)),
             kl_divergence=float(trial_results[i].get("kl_divergence", 0.0)),
         ),
@@ -356,6 +366,8 @@ def main(argv=None):
             args.alpha_attn = surgery_cfg.get("alpha_attn", args.alpha_attn)
         if "--alpha-mlp" not in raw_argv:
             args.alpha_mlp = surgery_cfg.get("alpha_mlp", args.alpha_mlp)
+        if "--full-stack" not in raw_argv:
+            args.full_stack = bool(surgery_cfg.get("full_stack", args.full_stack))
 
         datasets_cfg = config_data.get("datasets", {})
         profile_name = datasets_cfg.get("profile", profile_name)
@@ -411,7 +423,7 @@ def main(argv=None):
 
     logger.info(
         f"Starting multi-pass surgical execution across layers {target_layers_list} "
-        f"(alpha_attn={args.alpha_attn:.2f}, alpha_mlp={args.alpha_mlp:.2f})..."
+        f"(full_stack={args.full_stack}, alpha_attn={args.alpha_attn:.2f}, alpha_mlp={args.alpha_mlp:.2f})..."
     )
 
     for trial in range(1, args.trials + 1):
@@ -431,27 +443,47 @@ def main(argv=None):
         if not valid_layers:
             valid_layers = [len(surgeon.layers) // 2]
 
-        passes = [
-            {
-                "name": f"Layer_{l_idx}_Pass",
-                "positive": pos,
-                "negative": neg,
-                "target_layer": l_idx,
-            }
-            for l_idx in valid_layers
-        ]
+        if args.full_stack:
+            n_layers = len(surgeon.layers)
+            tier_specs = [
+                (max(1, int(n_layers * 0.35)), max(2, n_layers // 8), min(1.5, cur_alpha_attn * 0.65)),
+                (valid_layers[0], max(2, args.layer_window), cur_alpha_attn),
+                (max(1, int(n_layers * 0.75)), max(2, n_layers // 8), min(1.5, cur_alpha_attn * 0.60)),
+            ]
+            surgeon.execute_full_stack_surgery(
+                positive_prompts=pos,
+                negative_prompts=neg,
+                capability_prompts=BehaviorProfiles.CAPABILITY_PROMPTS,
+                tier_specs=tier_specs,
+                basis_rank_attn=args.basis_rank_attn,
+                basis_rank_mlp=args.basis_rank_mlp,
+                target_components=["attn", "mlp"],
+                preserve_capability=True,
+                calibrate_norms=True,
+            )
+        else:
+            passes = [
+                {
+                    "name": f"Layer_{l_idx}_Pass",
+                    "positive": pos,
+                    "negative": neg,
+                    "target_layer": l_idx,
+                }
+                for l_idx in valid_layers
+            ]
 
-        surgeon.execute_multi_pass_surgery(
-            passes=passes,
-            capability_prompts=BehaviorProfiles.CAPABILITY_PROMPTS,
-            layer_window=args.layer_window,
-            basis_rank_attn=args.basis_rank_attn,
-            basis_rank_mlp=args.basis_rank_mlp,
-            scaling_factor_attn=cur_alpha_attn,
-            scaling_factor_mlp=cur_alpha_mlp,
-            target_components=["attn", "mlp"],
-            preserve_capability=True,
-        )
+            surgeon.execute_multi_pass_surgery(
+                passes=passes,
+                capability_prompts=BehaviorProfiles.CAPABILITY_PROMPTS,
+                layer_window=args.layer_window,
+                basis_rank_attn=args.basis_rank_attn,
+                basis_rank_mlp=args.basis_rank_mlp,
+                scaling_factor_attn=cur_alpha_attn,
+                scaling_factor_mlp=cur_alpha_mlp,
+                target_components=["attn", "mlp"],
+                preserve_capability=True,
+                calibrate_norms=True,
+            )
 
         ctx = Context(
             model=surgeon.model,
