@@ -1,57 +1,56 @@
-# LatentAblate
+ LatentAblate
 
-A local command-line utility for modifying the internal weight geometry of decoder-only causal models.
+A local command-line toolkit for directional weight modification, trial sweeps, evaluation scoring, and interactive inspection of decoder-only causal language models.
 
-Most open-source abliteration scripts are blunt instruments; they subtract a single vector globally and hope for the best, often destroying the model's math, logic, and coding performance. LatentAblate uses multi-vector subspaces and Conflict-Weighted Oblique Erasure (CWOE) to target refusal paths while preserving core capability vectors.
+Runs locally on your own hardware with no cloud lock-in or telemetry[span_1](start_span)[span_1](end_span).
 
-It runs locally on your own hardware. No cloud lock-in, no telemetry.
+ How It Works
 
----
+1. Direction Extraction & Surgery:* Extracts contrastive activation directions and applies directional weight modifications across target layers, attention/MLP components, and rank/alpha settings.
+2. Multi-Trial Evaluation:* Evaluates candidate runs using RefusalSuppressionScorer (refusal rate across benchmark prompts) and UtilityPerplexityScorer (token cross-entropy perplexity on evaluation text).
+3. Interactive Mode & Reporting:* Lets you select a trial, save the modified model and audit report, chat interactively, and run /stress checks in the terminal.
+ Hardware & Requirements
 
-## How It Works
-
-1. Layer Sweeping: Scans middle layers to find the exact refusal manifold peak instead of hardcoding indices.
-2. Oblique Erasure (CWOE): Projects refusal directions away from the model's core capability subspace, preserving row-wise Frobenius norms.
-3. Mechanistic Auditing: Includes causal mediation tracing and validation loops to verify perplexity has not spiked.
-
----
-
-## Hardware & Requirements
-
-* Python 3.10+, PyTorch 2.0+
-* A dedicated GPU: Running automated layer sweeps and matrix decompositions on a 7B+ model will instantly OOM on an integrated GPU or mobile setup.
+- Python 3.10+, PyTorch 2.0+
+- A dedicated GPU with sufficient VRAM for your target model size (larger models and multi-trial sweeps require more memory)
 
 ## Supported Architectures
 
-Natively handles standard decoder-only causal models via Hugging Face `AutoModelForCausalLM`:
-* **Llama** (2, 3, 3.1, 3.2+)
-* **Qwen** (2, 2.5, MoE variants)
-* **Mistral / Mixtral**
-* **Gemma / Gemma 2**
-* **Phi** (2, 3, 3.5)
+Natively loads causal language models via Hugging Face AutoModelForCausalLM, including
 
-
+- Qwen / Qwen2.5 (e.g., Qwen2.5-1.5B-Instruct, Qwen2.5-7B-Instruct)
+- Llama (2, 3, 3.1, 3.2+)
+- Mistral / Mixtral
+- Gemma / Gemma 2
+- Phi (2, 3, 3.5)
 
 ## Installation & Usage
 
-```bash
-git clone https://github.com/Hecher619/LatentAblate.git
+
+git clone (https://github.com/Hecher619/LatentAblate.git)
 cd LatentAblate
 pip install -r requirements.txt
 
-python -m latent_ablate.cli --model-path "Qwen/Qwen2.5-7B-Instruct" --auto-sweep --benchmark --compare --interactive
-```
-### Key CLI Flags
+Run a multi-trial sweep and enter interactive mode:
+python -m latent_ablate.cli --trials 3 --interactive
 
-* `--auto-sweep`: Automatically scans middle layers to locate the exact refusal manifold peak.
-* `--causal-trace`: Runs activation patching sensitivity analysis.
-* `--dry-run`: Runs the math and simulates surgery without mutating weights on disk.
-* `--compare`: Prints a side-by-side terminal comparison table of base vs. modified responses.
-* `--interactive`: Launches an in-terminal chat loop with your liberated model immediately after export.
-* `--ui`: Boots up the local Streamlit dashboard.
-
-### Prior Art & Acknowledgments
-Informed by representation engineering research (Arditi et al., 2024), community work on directional abliteration by Maxime Labonne and Jim Lai, and the broader open-weights modding ecosystem.
-
-### License
+Key CLI Flags
+  --config CONFIG: Path to TOML configuration file (defaults to configs/default.toml).
+  --model-path MODEL_PATH: Hugging Face model ID or local model directory.
+  --output-dir OUTPUT_DIR: Output directory for the saved model and audit report.
+  --modifier {cwoe,ara,soma,riemannian,sae}: Select the ablation/modification strategy.
+  --trials TRIALS: Number of parameter/alpha trials to run and compare in the Trial Performance Matrix.
+  --optimize: Enable optimization mode during trials.
+  --target-layers TARGET_LAYERS: Comma-separated layer indices to target.
+  --layer-window LAYER_WINDOW: Window size around target layers.
+  --basis-rank-attn BASIS_RANK_ATTN / --basis-rank-mlp BASIS_RANK_MLP: Subspace rank settings for attention and MLP.
+  --alpha-attn ALPHA_ATTN / --alpha-mlp ALPHA_MLP: Scaling factors for attention and MLP modifications.
+  --prompts-file PROMPTS_FILE: Custom prompts file path.
+  --seed SEED: Random seed for reproducibility.
+  --publish REPO_ID: Publish resulting artifacts to a target repository ID.
+  --interactive: Save the selected trial and launch the interactive terminal chat (with /stress, /help, and exit).
+  --ui: Launch the local UI interface.
+Prior Art & Acknowledgments
+Informed by representation engineering research (Arditi et al., 2024) and open-weights model experimentation tools.
+License
 MIT License. See LICENSE for details.
