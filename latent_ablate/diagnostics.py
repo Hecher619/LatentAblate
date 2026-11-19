@@ -24,3 +24,20 @@ def summarize_subspace_conflict(direction: torch.Tensor, capability_basis: torch
         "capability_conflict": round(score, 4),
         "has_capability_basis": True,
     }
+
+
+class ModelDiagnostics:
+    """Tracks weight drift and subspace conflict metrics across ablation steps."""
+
+    def __init__(self):
+        self.records = []
+
+    def record_delta(self, label: str, before_weight: torch.Tensor, after_weight: torch.Tensor) -> dict:
+        entry = {"label": label, **measure_layer_delta(before_weight, after_weight)}
+        self.records.append(entry)
+        return entry
+
+    def record_conflict(self, label: str, direction: torch.Tensor, capability_basis: torch.Tensor | None = None) -> dict:
+        entry = {"label": label, **summarize_subspace_conflict(direction, capability_basis)}
+        self.records.append(entry)
+        return entry
