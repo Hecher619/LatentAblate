@@ -102,3 +102,26 @@ def apply_erasure(
         return W_f32 - delta
 
     return W_f32
+
+
+def apply_multi_direction_erasure(
+    W: torch.Tensor,
+    directions: list[torch.Tensor],
+    alpha: float = 1.0,
+    decay_per_rank: float = 0.75,
+) -> torch.Tensor:
+    """
+    Sequentially applies directional weight updates across a list of unit directions,
+    scaling subsequent directions by `decay_per_rank ** i` to keep updates controlled.
+    """
+    updated = W.float().to(W.device)
+    if updated.ndim != 2 or not directions:
+        return updated
+
+    for idx, vec in enumerate(directions):
+        if vec is None or vec.numel() == 0:
+            continue
+        scaled_alpha = alpha * (decay_per_rank ** idx)
+        updated = apply_erasure(updated, vec, w=vec, alpha=scaled_alpha)
+
+    return updated
