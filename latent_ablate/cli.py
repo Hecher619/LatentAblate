@@ -277,7 +277,7 @@ def run_interactive_chat_with_commands(
             if prompt.lower() == "/refine":
                 print("Applying multi-direction refinement step...")
                 stats = run_multi_direction_refinement(
-                    surgeon, pos, target_layer, layer_window, rank=2, step_alpha=0.25
+                    surgeon, pos, target_layer, layer_window, rank=4, step_alpha=0.25
                 )
                 reporter.log_step("interactive_multi_dir_refine", stats)
                 print(
@@ -311,7 +311,7 @@ def run_interactive_chat_with_commands(
                     attempts += 1
                     print(f"\033[1;33m[Auto-Refine {attempts}/{max_refines}]\033[0m Refining layer {target_layer} and retrying...")
                     stats = run_multi_direction_refinement(
-                        surgeon, pos, target_layer, layer_window, rank=2, step_alpha=0.25
+                        surgeon, pos, target_layer, layer_window, rank=4, step_alpha=0.25
                     )
                     reporter.log_step(f"auto_refine_{attempts}", stats)
                     response = generate_reply(model, tokenizer, device, prompt)

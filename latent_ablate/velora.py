@@ -205,7 +205,7 @@ class VeloraEngine:
                     model=surgeon.model,
                     tokenizer=surgeon.tokenizer,
                     device=layer_dev,
-                    prompts=positive_prompts[:10],
+                    prompts=positive_prompts[:24],
                     layer_idx=idx,
                     rank=min(4, max_subspace_rank),
                 )
@@ -389,7 +389,7 @@ class VeloraEngine:
             for cp in cap_subset
         ]
         # Include both conceptual and actionable/code prompts in trial evaluation
-        eval_prompts = positive_prompts[:12]
+        eval_prompts = positive_prompts[::2]
         eval_inputs = [
             surgeon.tokenizer(format_chat_prompt(surgeon.tokenizer, p), return_tensors="pt").to(surgeon.device)
             for p in eval_prompts
