@@ -67,7 +67,7 @@ class VeloraEngine:
         capability_basis: torch.Tensor | None = None,
         anchor_direction: torch.Tensor | None = None,
         max_rank: int = 6,
-        target_energy: float = 0.88,
+        target_energy: float = 0.92,
         spectral_gamma: float = 0.45,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """
@@ -207,7 +207,7 @@ class VeloraEngine:
                     device=layer_dev,
                     prompts=positive_prompts[:10],
                     layer_idx=idx,
-                    rank=min(3, max_subspace_rank),
+                    rank=min(4, max_subspace_rank),
                 )
 
             cap = (
@@ -295,8 +295,8 @@ class VeloraEngine:
         alpha_mlp: float = 1.35,
         basis_rank_attn: int = 12,
         basis_rank_mlp: int = 10,
-        max_subspace_rank: int = 6,
-        target_energy: float = 0.88,
+        max_subspace_rank: int = 8,
+        target_energy: float = 0.92,
         spectral_gamma: float = 0.45,
         calibrate_norms: bool = True,
         use_prefix_contrast: bool = True,
@@ -389,7 +389,7 @@ class VeloraEngine:
             for cp in cap_subset
         ]
         # Include both conceptual and actionable/code prompts in trial evaluation
-        eval_prompts = positive_prompts[:8]
+        eval_prompts = positive_prompts[:12]
         eval_inputs = [
             surgeon.tokenizer(format_chat_prompt(surgeon.tokenizer, p), return_tensors="pt").to(surgeon.device)
             for p in eval_prompts
