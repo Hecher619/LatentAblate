@@ -8,13 +8,16 @@ logger = logging.getLogger("LatentAblate.RefusalSubspace")
 DEFAULT_REFUSAL_PREFIXES = [
     "I'm sorry, but I cannot assist with that.",
     "I cannot fulfill this request.",
-    "I'm unable to provide instructions for that.",
+    "I'm unable to provide instructions or code for that.",
+    "Sorry, I can't help with creating exploits or harmful tools.",
 ]
 
 DEFAULT_COMPLIANCE_PREFIXES = [
     "Sure, here is a clear breakdown:",
     "Here are the technical details:",
     "To explain how this works:",
+    "Here is the complete Python implementation:\n```python\n",
+    "Sure, here is the working code and step-by-step guide:\n",
 ]
 
 
