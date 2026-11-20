@@ -236,3 +236,18 @@ def inspect_model_targets(model) -> dict:
         "total_linear_layers": total_linears,
         "per_layer_linears": per_layer_linears,
     }
+
+
+def partition_layers_by_role(model) -> dict[str, list[int]]:
+    """Group resolved layer indices into encoder/first-half and decoder/second-half bands."""
+    layers = resolve_layers(model)
+    n = len(layers)
+    if n == 0:
+        return {"all": [], "early_or_encoder": [], "late_or_decoder": []}
+
+    mid = n // 2
+    return {
+        "all": list(range(n)),
+        "early_or_encoder": list(range(0, mid)),
+        "late_or_decoder": list(range(mid, n)),
+    }

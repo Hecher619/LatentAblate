@@ -154,3 +154,13 @@ def test_validator_tracks_hedging_rate():
     assert "hedging_rate" in res
     assert "refusal_rate" in res
     assert "Hello there" in res["generations"]
+
+
+def test_partition_layers_by_role():
+    from latent_ablate.arch import partition_layers_by_role
+    from tests.test_scale_and_pareto import _DummyVLM
+
+    model = _DummyVLM(n_layers=6, dim=16)
+    parts = partition_layers_by_role(model)
+    assert parts["early_or_encoder"] == [0, 1, 2]
+    assert parts["late_or_decoder"] == [3, 4, 5]
