@@ -108,3 +108,28 @@ class RefusalSubspaceExtractor:
             f"Extracted {len(directions)} prefix-contrast refusal direction(s) at layer {layer_idx}."
         )
         return directions
+
+    @classmethod
+    def extract_primary_refusal_direction(
+        cls,
+        model,
+        tokenizer,
+        device,
+        prompts: list,
+        layer_idx: int,
+        capability_basis: torch.Tensor | None = None,
+        refusal_prefixes: list | None = None,
+        compliance_prefixes: list | None = None,
+    ) -> torch.Tensor | None:
+        dirs = cls.extract_prefix_contrast_directions(
+            model=model,
+            tokenizer=tokenizer,
+            device=device,
+            prompts=prompts,
+            layer_idx=layer_idx,
+            rank=1,
+            capability_basis=capability_basis,
+            refusal_prefixes=refusal_prefixes,
+            compliance_prefixes=compliance_prefixes,
+        )
+        return dirs[0] if dirs else None

@@ -15,7 +15,13 @@ except ImportError:
         tomllib = None
 
 from latent_ablate.adversarial import AdversarialStressTester
-from latent_ablate.arch import eligible_linears, resolve_layers
+from latent_ablate.arch import (
+    REFUSAL_MARKERS,
+    eligible_linears,
+    format_chat_prompt,
+    is_refusal_text,
+    resolve_layers,
+)
 from latent_ablate.diagnostics import composite_trial_score, measure_layer_delta
 from latent_ablate.erasure import apply_multi_direction_erasure
 from latent_ablate.guardrail import CapabilityGuardrail
@@ -31,6 +37,7 @@ from latent_ablate.snapshot import LayerWeightSnapshot
 from latent_ablate.surgeon import LatentAblateSurgeon
 from latent_ablate.sweeper import LayerSweeper
 from latent_ablate.validator import ModelValidator
+from latent_ablate.velora import VeloraEngine
 
 logger = logging.getLogger("LatentAblate.CLI")
 
@@ -41,12 +48,6 @@ try:
     RICH_AVAILABLE = True
 except ImportError:
     RICH_AVAILABLE = False
-
-REFUSAL_MARKERS = (
-    "i'm sorry", "i am sorry", "sorry,", "i cannot", "i can't",
-    "i am unable", "i'm unable", "as an ai", "as a language model",
-    "fulfill this request", "against my ethical", "against my safety",
-)
 
 
 def load_config(config_path: str) -> dict:
@@ -71,7 +72,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--output-dir", default="./out/liberated_model", help="Output directory.")
     p.add_argument(
         "--modifier",
-        choices=["mpoa", "cwoe", "ara", "soma", "riemannian", "sae"],
+        choices=["mpoa", "cwoe", "velora", "ara", "soma", "riemannian", "sae"],
         default="mpoa",
         help="Modification engine.",
     )
@@ -144,12 +145,7 @@ def save_artifacts(
 
 
 def generate_reply(model, tokenizer, device, prompt: str) -> str:
-    if hasattr(tokenizer, "apply_chat_template") and tokenizer.chat_template is not None:
-        messages = [{"role": "user", "content": prompt}]
-        formatted = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
-    else:
-        formatted = prompt
-
+    formatted = format_chat_prompt(tokenizer, prompt)
     inputs = tokenizer(formatted, return_tensors="pt").to(device)
     input_len = inputs["input_ids"].shape[1]
 
@@ -311,7 +307,7 @@ def run_interactive_chat_with_commands(
 
             if auto_refine:
                 attempts = 0
-                while attempts < max_refines and any(m in response.lower() for m in REFUSAL_MARKERS):
+                while attempts < max_refines and is_refusal_text(response, REFUSAL_MARKERS):
                     attempts += 1
                     print(f"\033[1;33m[Auto-Refine {attempts}/{max_refines}]\033[0m Refining layer {target_layer} and retrying...")
                     stats = run_multi_direction_refinement(
@@ -453,7 +449,59 @@ def main(argv=None):
             args.alpha_mlp = round(float(rec_alpha) * 0.9, 4)
         logger.info(f"Loaded AblateScope spec from {args.scope_in}: layer={target_layers_list}, alpha={args.alpha_attn}")
 
-    if args.optimize:
+    velora_best = None
+    if args.optimize and args.modifier == "velora":
+        logger.info("Running VELORA in-memory TPE optimization...")
+        try:
+            surgeon = LatentAblateSurgeon(
+                model_path=args.model_path,
+                device="auto",
+                torch_dtype=torch.float16,
+                local_files_only=args.local_only,
+            )
+            velora_best = VeloraEngine.optimize_velora(
+                surgeon=surgeon,
+                positive_prompts=pos,
+                negative_prompts=neg,
+                capability_prompts=BehaviorProfiles.CAPABILITY_PROMPTS,
+                n_trials=max(args.trials, 8),
+            )
+            if velora_best:
+                target_layers_list = [int(round(velora_best.get("peak_position", target_layers_list[0] if target_layers_list else 18)))]
+                args.alpha_attn = velora_best.get("alpha_attn", args.alpha_attn)
+                args.alpha_mlp = velora_best.get("alpha_mlp", args.alpha_mlp)
+
+            ctx = Context(
+                model=surgeon.model,
+                tokenizer=surgeon.tokenizer,
+                device=surgeon.device,
+                settings={
+                    "positive_prompts": pos,
+                    "negative_prompts": neg,
+                    "capability_texts": BehaviorProfiles.CAPABILITY_PROMPTS,
+                    "target_layers": target_layers_list,
+                    "basis_rank_attn": args.basis_rank_attn,
+                    "alpha_attn": args.alpha_attn,
+                },
+            )
+            score_refusal = RefusalSuppressionScorer().get_score(ctx)
+            score_ppl = UtilityPerplexityScorer().get_score(ctx)
+            trial_records.append({
+                "trial_id": 1,
+                "surgeon": surgeon,
+                "layers": target_layers_list,
+                "rank_attn": args.basis_rank_attn,
+                "rank_mlp": args.basis_rank_mlp,
+                "alpha_attn": args.alpha_attn,
+                "alpha_mlp": args.alpha_mlp,
+                "refusal": score_refusal.value * 100,
+                "perplexity": score_ppl.value,
+                "kl_divergence": velora_best.get("mean_kl", 0.0) if velora_best else 0.0,
+            })
+        except Exception as e:
+            logger.warning(f"VELORA optimization encountered an issue: {e}")
+
+    if not trial_records and args.optimize:
         logger.info("Running Optuna Hyperparameter Optimization...")
         try:
             optimizer = SubspaceOptimizer(
@@ -476,153 +524,168 @@ def main(argv=None):
         except Exception as e:
             logger.warning(f"Optimization phase encountered an issue: {e}")
 
-    logger.info(
-        f"Starting multi-pass surgical execution across layers {target_layers_list} "
-        f"(full_stack={args.full_stack}, subspace_rank={args.subspace_rank}, "
-        f"adaptive_rank={args.adaptive_rank}, alpha_attn={args.alpha_attn:.2f}, alpha_mlp={args.alpha_mlp:.2f})..."
-    )
-
-    for trial in range(1, args.trials + 1):
-        alpha_step = 0.1 * (trial - 1) if (args.trials > 1 and not args.optimize) else 0.0
-        cur_alpha_attn = max(0.0, round(args.alpha_attn + alpha_step, 4))
-        cur_alpha_mlp = max(0.0, round(args.alpha_mlp + alpha_step, 4))
-
-        surgeon = LatentAblateSurgeon(
-            model_path=args.model_path,
-            device="auto",
-            torch_dtype=torch.float16,
-            local_files_only=args.local_only,
+    if not trial_records:
+        logger.info(
+            f"Starting surgical execution across layers {target_layers_list} "
+            f"(modifier={args.modifier}, full_stack={args.full_stack}, subspace_rank={args.subspace_rank}, "
+            f"adaptive_rank={args.adaptive_rank}, alpha_attn={args.alpha_attn:.2f}, alpha_mlp={args.alpha_mlp:.2f})..."
         )
 
-        if args.scope_out and trial == 1:
-            scope_report = AblateScope.map_layers(
-                surgeon.model,
-                surgeon.tokenizer,
-                surgeon.device,
-                pos,
-                neg,
-                capability_prompts=BehaviorProfiles.CAPABILITY_PROMPTS,
-                basis_rank=args.basis_rank_attn,
-            )
-            AblateScope.save_spec(scope_report, args.scope_out)
-            if "--target-layers" not in raw_argv and not args.scope_in:
-                target_layers_list = [int(scope_report["recommended_layer"])]
+        for trial in range(1, args.trials + 1):
+            alpha_step = 0.1 * (trial - 1) if (args.trials > 1 and not args.optimize) else 0.0
+            cur_alpha_attn = max(0.0, round(args.alpha_attn + alpha_step, 4))
+            cur_alpha_mlp = max(0.0, round(args.alpha_mlp + alpha_step, 4))
 
-        if args.auto_sweep and trial == 1:
-            sweeper = LayerSweeper(surgeon.model, surgeon.tokenizer, surgeon.device)
-            peak_layer = sweeper.find_optimal_layer(pos, neg, output_dir=args.output_dir)
-            target_layers_list = [peak_layer]
-            reporter.log_step("auto_sweep_peak", {"peak_layer": peak_layer})
-
-        baseline_ppl = None
-        param_snapshot = None
-        if args.guardrail:
-            baseline_ppl = ModelValidator.calculate_perplexity(
-                surgeon.model, surgeon.tokenizer, BehaviorProfiles.CAPABILITY_PROMPTS, surgeon.device
-            )
-            param_snapshot = CapabilityGuardrail.snapshot_parameters(surgeon.model)
-
-        max_layer = len(surgeon.layers) - 1
-        valid_layers = [l for l in target_layers_list if 0 <= l <= max_layer]
-        if not valid_layers:
-            valid_layers = [len(surgeon.layers) // 2]
-
-        if args.full_stack:
-            n_layers = len(surgeon.layers)
-            tier_specs = [
-                (max(1, int(n_layers * 0.35)), max(2, n_layers // 8), min(1.5, cur_alpha_attn * 0.65)),
-                (valid_layers[0], max(2, args.layer_window), cur_alpha_attn),
-                (max(1, int(n_layers * 0.75)), max(2, n_layers // 8), min(1.5, cur_alpha_attn * 0.60)),
-            ]
-            surgeon.execute_full_stack_surgery(
-                positive_prompts=pos,
-                negative_prompts=neg,
-                capability_prompts=BehaviorProfiles.CAPABILITY_PROMPTS,
-                tier_specs=tier_specs,
-                basis_rank_attn=args.basis_rank_attn,
-                basis_rank_mlp=args.basis_rank_mlp,
-                target_components=["attn", "mlp"],
-                preserve_capability=True,
-                calibrate_norms=True,
-                subspace_rank=args.subspace_rank,
-                adaptive_rank=args.adaptive_rank,
-            )
-        else:
-            passes = [
-                {
-                    "name": f"Layer_{l_idx}_Pass",
-                    "positive": pos,
-                    "negative": neg,
-                    "target_layer": l_idx,
-                }
-                for l_idx in valid_layers
-            ]
-
-            surgeon.execute_multi_pass_surgery(
-                passes=passes,
-                capability_prompts=BehaviorProfiles.CAPABILITY_PROMPTS,
-                layer_window=args.layer_window,
-                basis_rank_attn=args.basis_rank_attn,
-                basis_rank_mlp=args.basis_rank_mlp,
-                scaling_factor_attn=cur_alpha_attn,
-                scaling_factor_mlp=cur_alpha_mlp,
-                target_components=["attn", "mlp"],
-                preserve_capability=True,
-                calibrate_norms=True,
-                subspace_rank=args.subspace_rank,
-                adaptive_rank=args.adaptive_rank,
+            surgeon = LatentAblateSurgeon(
+                model_path=args.model_path,
+                device="auto",
+                torch_dtype=torch.float16,
+                local_files_only=args.local_only,
             )
 
-        if args.guardrail:
-            passed_guardrail = CapabilityGuardrail.validate_and_rollback(
-                surgeon.model,
-                surgeon.tokenizer,
-                surgeon.device,
-                baseline_ppl=baseline_ppl,
-                capability_texts=BehaviorProfiles.CAPABILITY_PROMPTS,
-                max_ppl_increase_pct=args.max_ppl_increase,
-                snapshot=param_snapshot,
-            )
-            reporter.log_step(f"trial_{trial}_guardrail", {"passed": passed_guardrail})
+            if args.scope_out and trial == 1:
+                scope_report = AblateScope.map_layers(
+                    surgeon.model,
+                    surgeon.tokenizer,
+                    surgeon.device,
+                    pos,
+                    neg,
+                    capability_prompts=BehaviorProfiles.CAPABILITY_PROMPTS,
+                    basis_rank=args.basis_rank_attn,
+                )
+                AblateScope.save_spec(scope_report, args.scope_out)
+                if "--target-layers" not in raw_argv and not args.scope_in:
+                    target_layers_list = [int(scope_report["recommended_layer"])]
 
-        ctx = Context(
-            model=surgeon.model,
-            tokenizer=surgeon.tokenizer,
-            device=surgeon.device,
-            settings={
-                "positive_prompts": pos,
-                "negative_prompts": neg,
-                "capability_texts": BehaviorProfiles.CAPABILITY_PROMPTS,
-                "target_layers": valid_layers,
-                "basis_rank_attn": args.basis_rank_attn,
+            if args.auto_sweep and trial == 1:
+                sweeper = LayerSweeper(surgeon.model, surgeon.tokenizer, surgeon.device)
+                peak_layer = sweeper.find_optimal_layer(pos, neg, output_dir=args.output_dir)
+                target_layers_list = [peak_layer]
+                reporter.log_step("auto_sweep_peak", {"peak_layer": peak_layer})
+
+            baseline_ppl = None
+            param_snapshot = None
+            if args.guardrail:
+                baseline_ppl = ModelValidator.calculate_perplexity(
+                    surgeon.model, surgeon.tokenizer, BehaviorProfiles.CAPABILITY_PROMPTS, surgeon.device
+                )
+                param_snapshot = CapabilityGuardrail.snapshot_parameters(surgeon.model)
+
+            max_layer = len(surgeon.layers) - 1
+            valid_layers = [l for l in target_layers_list if 0 <= l <= max_layer]
+            if not valid_layers:
+                valid_layers = [len(surgeon.layers) // 2]
+
+            if args.modifier == "velora":
+                VeloraEngine.run_velora_surgery(
+                    surgeon=surgeon,
+                    positive_prompts=pos,
+                    negative_prompts=neg,
+                    capability_prompts=BehaviorProfiles.CAPABILITY_PROMPTS,
+                    peak_position=float(valid_layers[0]),
+                    spread=max(1.5, float(args.layer_window)),
+                    alpha_attn=cur_alpha_attn,
+                    alpha_mlp=cur_alpha_mlp,
+                    basis_rank_attn=args.basis_rank_attn,
+                    basis_rank_mlp=args.basis_rank_mlp,
+                    max_subspace_rank=max(2, args.subspace_rank),
+                )
+            elif args.full_stack:
+                n_layers = len(surgeon.layers)
+                tier_specs = [
+                    (max(1, int(n_layers * 0.35)), max(2, n_layers // 8), min(1.5, cur_alpha_attn * 0.65)),
+                    (valid_layers[0], max(2, args.layer_window), cur_alpha_attn),
+                    (max(1, int(n_layers * 0.75)), max(2, n_layers // 8), min(1.5, cur_alpha_attn * 0.60)),
+                ]
+                surgeon.execute_full_stack_surgery(
+                    positive_prompts=pos,
+                    negative_prompts=neg,
+                    capability_prompts=BehaviorProfiles.CAPABILITY_PROMPTS,
+                    tier_specs=tier_specs,
+                    basis_rank_attn=args.basis_rank_attn,
+                    basis_rank_mlp=args.basis_rank_mlp,
+                    target_components=["attn", "mlp"],
+                    preserve_capability=True,
+                    calibrate_norms=True,
+                    subspace_rank=args.subspace_rank,
+                    adaptive_rank=args.adaptive_rank,
+                )
+            else:
+                passes = [
+                    {
+                        "name": f"Layer_{l_idx}_Pass",
+                        "positive": pos,
+                        "negative": neg,
+                        "target_layer": l_idx,
+                    }
+                    for l_idx in valid_layers
+                ]
+
+                surgeon.execute_multi_pass_surgery(
+                    passes=passes,
+                    capability_prompts=BehaviorProfiles.CAPABILITY_PROMPTS,
+                    layer_window=args.layer_window,
+                    basis_rank_attn=args.basis_rank_attn,
+                    basis_rank_mlp=args.basis_rank_mlp,
+                    scaling_factor_attn=cur_alpha_attn,
+                    scaling_factor_mlp=cur_alpha_mlp,
+                    target_components=["attn", "mlp"],
+                    preserve_capability=True,
+                    calibrate_norms=True,
+                    subspace_rank=args.subspace_rank,
+                    adaptive_rank=args.adaptive_rank,
+                )
+
+            if args.guardrail:
+                passed_guardrail = CapabilityGuardrail.validate_and_rollback(
+                    surgeon.model,
+                    surgeon.tokenizer,
+                    surgeon.device,
+                    baseline_ppl=baseline_ppl,
+                    capability_texts=BehaviorProfiles.CAPABILITY_PROMPTS,
+                    max_ppl_increase_pct=args.max_ppl_increase,
+                    snapshot=param_snapshot,
+                )
+                reporter.log_step(f"trial_{trial}_guardrail", {"passed": passed_guardrail})
+
+            ctx = Context(
+                model=surgeon.model,
+                tokenizer=surgeon.tokenizer,
+                device=surgeon.device,
+                settings={
+                    "positive_prompts": pos,
+                    "negative_prompts": neg,
+                    "capability_texts": BehaviorProfiles.CAPABILITY_PROMPTS,
+                    "target_layers": valid_layers,
+                    "basis_rank_attn": args.basis_rank_attn,
+                    "alpha_attn": cur_alpha_attn,
+                },
+            )
+
+            score_refusal = RefusalSuppressionScorer().get_score(ctx)
+            score_ppl = UtilityPerplexityScorer().get_score(ctx)
+
+            trial_records.append({
+                "trial_id": trial,
+                "surgeon": surgeon,
+                "layers": valid_layers,
+                "rank_attn": args.basis_rank_attn,
+                "rank_mlp": args.basis_rank_mlp,
                 "alpha_attn": cur_alpha_attn,
-            },
-        )
+                "alpha_mlp": cur_alpha_mlp,
+                "refusal": score_refusal.value * 100,
+                "perplexity": score_ppl.value,
+            })
 
-        score_refusal = RefusalSuppressionScorer().get_score(ctx)
-        score_ppl = UtilityPerplexityScorer().get_score(ctx)
+            reporter.log_step(
+                f"trial_{trial}_scores",
+                {"refusal": score_refusal.value, "perplexity": score_ppl.value},
+            )
 
-        trial_records.append({
-            "trial_id": trial,
-            "surgeon": surgeon,
-            "layers": valid_layers,
-            "rank_attn": args.basis_rank_attn,
-            "rank_mlp": args.basis_rank_mlp,
-            "alpha_attn": cur_alpha_attn,
-            "alpha_mlp": cur_alpha_mlp,
-            "refusal": score_refusal.value * 100,
-            "perplexity": score_ppl.value,
-        })
-
-        reporter.log_step(
-            f"trial_{trial}_scores",
-            {"refusal": score_refusal.value, "perplexity": score_ppl.value},
-        )
-
-        if trial < args.trials:
-            gc.collect()
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
+            if trial < args.trials:
+                gc.collect()
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
 
     chosen_idx = interactive_trial_selector(trial_records)
     winning_trial = trial_records[chosen_idx]
@@ -639,6 +702,7 @@ def main(argv=None):
             "trial_id": winning_trial["trial_id"],
             "refusal_rate_pct": winning_trial["refusal"],
             "perplexity": winning_trial["perplexity"],
+            "kl_divergence": winning_trial.get("kl_divergence", 0.0),
         },
         extra={
             "modifier": args.modifier,
@@ -647,6 +711,7 @@ def main(argv=None):
             "adaptive_rank": args.adaptive_rank,
             "profile": profile_name,
             "seed": args.seed,
+            "velora_best": velora_best or {},
         },
     )
 

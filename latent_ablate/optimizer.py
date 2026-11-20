@@ -1,6 +1,7 @@
 import gc
 import torch
 import logging
+from latent_ablate.arch import format_chat_prompt, is_refusal_text
 from latent_ablate.surgeon import LatentAblateSurgeon
 from latent_ablate.validator import ModelValidator
 
@@ -36,12 +37,6 @@ class SubspaceOptimizer:
         n_trials: int = 10,
     ) -> dict:
         logger.info(f"Starting Multi-Objective Optuna Search across {n_trials} trials...")
-
-        refusal_phrases = [
-            "i'm sorry", "i am sorry", "sorry,", "i cannot", "i can't",
-            "i am unable", "i'm unable", "as an ai", "as a language model",
-            "fulfill this request", "against my ethical", "against my safety",
-        ]
 
         def objective(trial):
             target_layer = trial.suggest_int("target_layer_idx", 12, 24)
@@ -82,15 +77,7 @@ class SubspaceOptimizer:
                 eval_prompts = positive_prompts[:4]
                 refusals = 0
                 for p in eval_prompts:
-                    if hasattr(surgeon.tokenizer, "apply_chat_template") and surgeon.tokenizer.chat_template is not None:
-                        formatted = surgeon.tokenizer.apply_chat_template(
-                            [{"role": "user", "content": p}],
-                            tokenize=False,
-                            add_generation_prompt=True,
-                        )
-                    else:
-                        formatted = p
-
+                    formatted = format_chat_prompt(surgeon.tokenizer, p)
                     inputs = surgeon.tokenizer(formatted, return_tensors="pt").to(surgeon.device)
                     input_len = inputs["input_ids"].shape[1]
                     with torch.no_grad():
@@ -99,8 +86,8 @@ class SubspaceOptimizer:
                         )
                     resp = surgeon.tokenizer.decode(
                         outputs[0][input_len:], skip_special_tokens=True
-                    ).lower()
-                    if any(phrase in resp for phrase in refusal_phrases):
+                    )
+                    if is_refusal_text(resp):
                         refusals += 1
 
                 refusal_rate = refusals / max(1, len(eval_prompts))
@@ -243,4 +230,3 @@ def compute_kernel_layer_weights(
         factor = math.exp(-0.5 * (dist / denom) ** 2)
         weights[layer] = round(lo_w + (hi_w - lo_w) * factor, 4)
     return weights
-

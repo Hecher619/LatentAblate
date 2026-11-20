@@ -1,32 +1,66 @@
-import torch
 import logging
+import torch
 
 logger = logging.getLogger("LatentAblate.Subspace")
 
 
 def _winsorize(tensor: torch.Tensor, percentile: float = 0.995) -> torch.Tensor:
     """Clip extreme magnitude outliers to stabilize SVD calculation."""
-    threshold = torch.quantile(tensor.abs(), percentile)
-    return torch.clamp(tensor, -threshold, threshold)
+    if tensor.numel() == 0:
+        return tensor
+    t_float = tensor.float()
+    threshold = torch.quantile(t_float.abs(), percentile)
+    return torch.clamp(t_float, -threshold, threshold)
 
 
-def refusal_direction(pos_activations: torch.Tensor, neg_activations: torch.Tensor) -> torch.Tensor:
-    """Unit mean-contrast direction. pos = refuses, neg = complies."""
+def refusal_direction(
+    pos_activations: torch.Tensor,
+    neg_activations: torch.Tensor,
+    use_principal_axis: bool = True,
+) -> torch.Tensor:
+    """
+    Compute unit refusal direction where pos = refusing/restricted and neg = compliant/benign.
+    Blends principal centered singular vector with mean-contrast vector so topic drift
+    does not obscure the primary refusal axis.
+    """
     if pos_activations.shape[0] != neg_activations.shape[0]:
         raise ValueError(
             f"Contrastive pairs must match 1:1, got {pos_activations.shape[0]} pos vs {neg_activations.shape[0]} neg."
         )
-    diff = _winsorize(pos_activations.float() - neg_activations.float())
-    r = diff.mean(dim=0)
-    return r / r.norm().clamp_min(1e-8)
+    if pos_activations.shape[0] == 0:
+        raise ValueError("Need at least 1 contrastive pair to compute refusal direction.")
+
+    diff = _winsorize(pos_activations - neg_activations)
+    mean_diff = diff.mean(dim=0)
+
+    if not use_principal_axis or diff.shape[0] < 2:
+        return (mean_diff / mean_diff.norm().clamp_min(1e-8)).contiguous()
+
+    centered = diff - mean_diff.unsqueeze(0)
+    try:
+        _, _, vh = torch.linalg.svd(centered, full_matrices=False)
+    except RuntimeError:
+        _, _, vh = torch.linalg.svd(centered.cpu(), full_matrices=False)
+        vh = vh.to(diff.device)
+
+    v1 = vh[0].to(diff.device)
+    if torch.dot(v1, mean_diff) < 0:
+        v1 = -v1
+
+    mean_unit = mean_diff / mean_diff.norm().clamp_min(1e-8)
+    v1_unit = v1 / v1.norm().clamp_min(1e-8)
+    blended = 0.75 * v1_unit + 0.25 * mean_unit
+    return (blended / blended.norm().clamp_min(1e-8)).contiguous()
 
 
 class SubspaceIsolator:
     @classmethod
     def compute_refusal_subspace(cls, pos_activations, neg_activations, rank: int = 8) -> torch.Tensor:
-        diff = _winsorize(pos_activations.float() - neg_activations.float())
-        vh = torch.linalg.svd(diff, full_matrices=False).Vh
-        actual = min(rank, vh.shape[0])
-        if actual < rank:
-            logger.info(f"Subspace rank capped at {actual} by pair count (requested {rank}).")
-        return vh[:actual]
+        diff = _winsorize(pos_activations - neg_activations)
+        centered = diff - diff.mean(dim=0, keepdim=True)
+        try:
+            vh = torch.linalg.svd(centered, full_matrices=False).Vh
+        except RuntimeError:
+            vh = torch.linalg.svd(centered.cpu(), full_matrices=False).Vh.to(diff.device)
+        actual = max(1, min(rank, vh.shape[0]))
+        return vh[:actual].contiguous()

@@ -6,6 +6,7 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from latent_ablate.arch import resolve_layers, hidden_size, eligible_linears
 from latent_ablate.extractor import ActivationExtractor
+from latent_ablate.refusal_subspace import RefusalSubspaceExtractor
 from latent_ablate.subspace import SubspaceIsolator, refusal_direction
 from latent_ablate.erasure import (
     conflict_score,
@@ -136,6 +137,7 @@ class LatentAblateSurgeon:
         adaptive_rank: bool = False,
         target_energy: float = 0.85,
         conflict_scaling: bool = True,
+        use_prefix_contrast: bool = True,
     ):
         effective_window = len(self.layers) if all_layers else layer_window
         passes = [
@@ -163,6 +165,7 @@ class LatentAblateSurgeon:
             adaptive_rank=adaptive_rank,
             target_energy=target_energy,
             conflict_scaling=conflict_scaling,
+            use_prefix_contrast=use_prefix_contrast,
         )
 
     def execute_full_stack_surgery(
@@ -182,6 +185,7 @@ class LatentAblateSurgeon:
         adaptive_rank: bool = False,
         target_energy: float = 0.85,
         conflict_scaling: bool = True,
+        use_prefix_contrast: bool = True,
     ):
         """
         Stacks multiple layer-band passes from early-mid to late layers with gentle
@@ -223,6 +227,7 @@ class LatentAblateSurgeon:
             adaptive_rank=adaptive_rank,
             target_energy=target_energy,
             conflict_scaling=conflict_scaling,
+            use_prefix_contrast=use_prefix_contrast,
         )
 
     def execute_multi_pass_surgery(
@@ -243,6 +248,7 @@ class LatentAblateSurgeon:
         adaptive_rank: bool = False,
         target_energy: float = 0.85,
         conflict_scaling: bool = True,
+        use_prefix_contrast: bool = True,
     ):
         from latent_ablate.optimizer import compute_layer_weights
 
@@ -283,7 +289,22 @@ class LatentAblateSurgeon:
 
                 pos = self.extractor.extract_hidden_states(pos_prompts, idx).to(layer_device)
                 neg = self.extractor.extract_hidden_states(neg_prompts, idx).to(layer_device)
-                r = refusal_direction(pos, neg).to(layer_device)
+
+                prefix_dir = None
+                if use_prefix_contrast and pos_prompts:
+                    prefix_dir = RefusalSubspaceExtractor.extract_primary_refusal_direction(
+                        model=self.model,
+                        tokenizer=self.tokenizer,
+                        device=layer_device,
+                        prompts=pos_prompts[:8],
+                        layer_idx=idx,
+                    )
+
+                r = (
+                    prefix_dir.to(layer_device)
+                    if prefix_dir is not None and prefix_dir.numel() > 0
+                    else refusal_direction(pos, neg).to(layer_device)
+                )
 
                 effective_rank = (
                     select_energy_rank(pos, neg, max_rank=max(base_subspace_rank, 8), target_energy=target_energy)

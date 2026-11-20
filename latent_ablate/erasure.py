@@ -3,7 +3,7 @@ import logging
 
 logger = logging.getLogger("LatentAblate.Erasure")
 
-ORTHO_FALLBACK = 1e-3
+ORTHO_FALLBACK = 1e-6
 
 
 def _is_meta(tensor: torch.Tensor | None) -> bool:
@@ -84,7 +84,12 @@ def select_energy_rank(
     return upper
 
 
-def conflict_scaled_alpha(base_alpha: float, c_score: float, sensitivity: float = 0.5, floor: float = 0.25) -> float:
+def conflict_scaled_alpha(
+    base_alpha: float,
+    c_score: float,
+    sensitivity: float = 0.25,
+    floor: float = 0.55,
+) -> float:
     """Scales `base_alpha` down smoothly when refusal overlaps with capability subspace (`c_score` in [0, 1])."""
     clamped_conflict = max(0.0, min(1.0, float(c_score)))
     scale = max(float(floor), 1.0 - float(sensitivity) * clamped_conflict)
@@ -145,10 +150,13 @@ def oblique_weights(r: torch.Tensor, basis: torch.Tensor) -> tuple:
         b = basis.to(device).float()
         if b.ndim == 1:
             b = b.unsqueeze(0)
+        if b.shape[0] > 0:
+            q, _ = torch.linalg.qr(b.T, mode="reduced")
+            b = q.T
         r_perp = r_unit - b.T @ (b @ r_unit)
         norm_perp = r_perp.norm()
-        if not _is_meta(norm_perp) and norm_perp > ORTHO_FALLBACK:
-            return r_unit, r_perp / norm_perp
+        if not _is_meta(norm_perp) and float(norm_perp.item()) > ORTHO_FALLBACK:
+            return r_unit, (r_perp / norm_perp).contiguous()
 
     return r_unit, r_unit
 
