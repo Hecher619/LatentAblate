@@ -208,7 +208,6 @@ class VeloraEngine:
                     prompts=positive_prompts[:24],
                     layer_idx=idx,
                     rank=min(4, max_subspace_rank),
-                    response_prefix=getattr(surgeon.extractor, "response_prefix", ""),
                 )
 
             cap = (
