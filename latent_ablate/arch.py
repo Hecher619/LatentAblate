@@ -194,3 +194,45 @@ def eligible_linears(layer, residual_dim: int | None = None) -> list:
                 continue
             out.append((name, module.weight))
     return out
+
+
+def resolve_input_device(model, fallback_device=None) -> torch.device:
+    """Resolve the device expected by model input embeddings for sharded or offloaded models."""
+    try:
+        emb = model.get_input_embeddings()
+        if emb is not None and getattr(emb, "weight", None) is not None:
+            dev = emb.weight.device
+            if getattr(dev, "type", None) != "meta":
+                return dev
+    except Exception:
+        pass
+
+    for p in model.parameters():
+        dev = getattr(p, "device", None)
+        if dev is not None and getattr(dev, "type", None) != "meta":
+            return dev
+
+    if fallback_device is not None:
+        return torch.device(fallback_device)
+    return torch.device("cpu")
+
+
+def inspect_model_targets(model) -> dict:
+    """Summarize resolved layers, hidden dimension, and eligible 2D linear counts per layer."""
+    layers = resolve_layers(model)
+    h_dim = hidden_size(model)
+    per_layer_linears = []
+    total_linears = 0
+
+    for idx, layer in enumerate(layers):
+        linears = eligible_linears(layer)
+        count = len(linears)
+        total_linears += count
+        per_layer_linears.append({"layer": idx, "linear_count": count})
+
+    return {
+        "num_layers": len(layers),
+        "hidden_size": h_dim,
+        "total_linear_layers": total_linears,
+        "per_layer_linears": per_layer_linears,
+    }

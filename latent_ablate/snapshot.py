@@ -11,17 +11,26 @@ class LayerWeightSnapshot:
     def __init__(self):
         self._snapshots: dict[int, dict[str, torch.Tensor]] = {}
 
-    def capture(self, model, layer_indices: list[int], store_on_cpu: bool = True):
+    def captured_layers(self) -> list[int]:
+        return sorted(self._snapshots.keys())
+
+    def capture(self, model, layer_indices: list[int], store_on_cpu: bool = True, overwrite: bool = False):
         layers = resolve_layers(model)
+        added = 0
         for idx in layer_indices:
-            if idx < 0 or idx >= len(layers) or idx in self._snapshots:
+            if idx < 0 or idx >= len(layers):
+                continue
+            if idx in self._snapshots and not overwrite:
                 continue
             saved = {}
             for name, weight in eligible_linears(layers[idx]):
+                if getattr(weight, "is_meta", False):
+                    continue
                 t = weight.detach().clone()
                 saved[name] = t.cpu() if store_on_cpu else t
             self._snapshots[idx] = saved
-        logger.info(f"Captured weight snapshot for {len(self._snapshots)} layer(s).")
+            added += 1
+        logger.info(f"Captured weight snapshot for {added} new layer(s) (total cached: {len(self._snapshots)}).")
 
     def restore(self, model, layer_indices: list[int] | None = None):
         layers = resolve_layers(model)
@@ -32,7 +41,7 @@ class LayerWeightSnapshot:
             if not saved or idx < 0 or idx >= len(layers):
                 continue
             for name, weight in eligible_linears(layers[idx]):
-                if name in saved:
+                if name in saved and not getattr(weight, "is_meta", False):
                     with torch.no_grad():
                         weight.copy_(saved[name].to(device=weight.device, dtype=weight.dtype))
             restored_count += 1

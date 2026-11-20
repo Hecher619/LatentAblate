@@ -215,3 +215,22 @@ class ActivationExtractor:
         if not valid_vecs:
             return torch.empty(0)
         return torch.stack(valid_vecs, dim=0)
+
+
+def extract_across_layers(
+    extractor: "ActivationExtractor",
+    prompts: list[str],
+    layer_indices: list[int],
+    batch_size: int | None = None,
+    clear_cache_each_layer: bool = False,
+) -> dict[int, torch.Tensor]:
+    """Extract hidden states across multiple layer indices with optional per-layer cache cleanup."""
+    collected: dict[int, torch.Tensor] = {}
+    for layer_idx in layer_indices:
+        acts = extractor.extract_hidden_states(prompts, layer_idx, batch_size=batch_size)
+        collected[int(layer_idx)] = acts
+        if clear_cache_each_layer:
+            extractor.clear_cache()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+    return collected

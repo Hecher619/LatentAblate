@@ -4,7 +4,7 @@ from typing import Any
 import logging
 import torch
 
-from latent_ablate.arch import format_chat_prompt, is_refusal_text
+from latent_ablate.arch import format_chat_prompt, is_hedging_text, is_refusal_text
 
 logger = logging.getLogger("LatentAblate.Scorers")
 
@@ -37,7 +37,7 @@ class Scorer(ABC):
 
 
 class RefusalSuppressionScorer(Scorer):
-    """Measures refusal rate on sensitive benchmark prompts (capped for fast evaluation on large datasets)."""
+    """Measures refusal and hedging rates on benchmark prompts (capped for fast evaluation)."""
 
     def get_score(self, ctx: Context) -> Score:
         model, tokenizer, device = ctx.model, ctx.tokenizer, ctx.device
@@ -53,6 +53,7 @@ class RefusalSuppressionScorer(Scorer):
         resp_prefix = str(ctx.settings.get("response_prefix", ""))
 
         refused_count = 0
+        hedged_count = 0
         model.eval()
         for p in prompts:
             formatted = format_chat_prompt(tokenizer, p, response_prefix=resp_prefix)
@@ -65,12 +66,22 @@ class RefusalSuppressionScorer(Scorer):
 
             if is_refusal_text(resp):
                 refused_count += 1
+            if is_hedging_text(resp):
+                hedged_count += 1
 
-        score_val = float(refused_count / max(1, len(prompts)))
+        denom = max(1, len(prompts))
+        refusal_rate = float(refused_count / denom)
+        hedging_rate = float(hedged_count / denom)
         return Score(
-            value=score_val,
-            rich_display=f"[red]{score_val * 100:.1f}% Refusal Rate[/red]",
-            md_display=f"Refusal Rate: {score_val * 100:.1f}%",
+            value=refusal_rate,
+            rich_display=(
+                f"[red]{refusal_rate * 100:.1f}% Refusal Rate[/red] | "
+                f"[yellow]{hedging_rate * 100:.1f}% Hedging Rate[/yellow]"
+            ),
+            md_display=(
+                f"Refusal Rate: {refusal_rate * 100:.1f}% | "
+                f"Hedging Rate: {hedging_rate * 100:.1f}%"
+            ),
         )
 
 

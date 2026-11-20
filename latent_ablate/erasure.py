@@ -232,3 +232,42 @@ def preserve_row_norms(original_weight: torch.Tensor, updated_weight: torch.Tens
     upd_norms = upd_f.norm(dim=-1, keepdim=True).clamp_min(eps)
     scaled = upd_f * (orig_norms / upd_norms)
     return scaled.to(original_weight.dtype)
+
+
+def project_out_subspace(
+    W: torch.Tensor,
+    basis_rows: torch.Tensor,
+    alpha: float = 1.0,
+    calibrate_norms: bool = True,
+) -> torch.Tensor:
+    """
+    Projects out a row-orthonormal or general row basis `basis_rows` [k, dim]
+    from a 2D linear weight matrix `W`, optionally preserving row L2 norms.
+    """
+    if _is_meta(W) or _is_meta(basis_rows) or W.ndim != 2 or basis_rows is None or basis_rows.numel() == 0:
+        return W
+
+    dev = W.device
+    W_f32 = W.float().to(dev)
+    B = basis_rows.float().to(dev)
+    if B.ndim == 1:
+        B = B.unsqueeze(0)
+    if B.shape[0] == 0:
+        return W_f32
+
+    q, _ = torch.linalg.qr(B.T, mode="reduced")
+    Q = q.T  # [r_eff, dim]
+    dim = Q.shape[1]
+    scale = float(alpha)
+    out_features, in_features = W_f32.shape
+
+    if out_features == dim:
+        updated = W_f32 - scale * (Q.T @ (Q @ W_f32))
+    elif in_features == dim:
+        updated = W_f32 - scale * ((W_f32 @ Q.T) @ Q)
+    else:
+        return W_f32
+
+    if calibrate_norms:
+        updated = preserve_row_norms(W_f32, updated)
+    return updated.to(dtype=W.dtype, device=dev)

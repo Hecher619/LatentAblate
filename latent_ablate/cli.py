@@ -78,6 +78,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--config", default="configs/default.toml", help="Path to config file.")
     p.add_argument("--model-path", default="Qwen/Qwen2.5-1.5B-Instruct", help="Model path or HF repo ID.")
     p.add_argument("--local-only", action="store_true", help="Load models and tokenizers strictly from local cache/disk.")
+    p.add_argument("--load-in-4bit", action="store_true", help="Load target model in 4-bit NF4 quantization via bitsandbytes.")
+    p.add_argument("--dry-run", action="store_true", help="Print resolved layer depth, default target layers, and plan without mutating weights.")
     p.add_argument("--output-dir", default="./out/liberated_model", help="Output directory.")
     p.add_argument(
         "--preset",
@@ -403,6 +405,53 @@ def interactive_trial_selector(trial_results: list) -> int:
         ),
     )
     return best_idx
+
+
+def run_guarded_surgery(
+    surgeon: LatentAblateSurgeon,
+    surgery_fn,
+    capability_texts: list[str],
+    enable_guardrail: bool = False,
+    max_ppl_increase_pct: float = 25.0,
+) -> dict:
+    """Run a surgery callable with optional baseline PPL capture and automatic rollback."""
+    baseline_ppl = None
+    snapshot = None
+    if enable_guardrail and capability_texts:
+        snapshot = CapabilityGuardrail.snapshot_parameters(surgeon.model)
+        baseline_ppl = ModelValidator.calculate_perplexity(
+            surgeon.model, surgeon.tokenizer, capability_texts, surgeon.device
+        )
+
+    result = surgery_fn()
+    passed = True
+    if enable_guardrail and capability_texts:
+        passed = CapabilityGuardrail.validate_and_rollback(
+            model=surgeon.model,
+            tokenizer=surgeon.tokenizer,
+            device=surgeon.device,
+            baseline_ppl=baseline_ppl,
+            capability_texts=capability_texts,
+            max_ppl_increase_pct=max_ppl_increase_pct,
+            snapshot=snapshot,
+        )
+
+    return {"result": result, "guardrail_passed": passed, "baseline_ppl": baseline_ppl}
+
+
+def summarize_surgery_plan(n_layers: int, hidden_dim: int, target_layers: list[int] | None, window: int, alpha_attn: float, alpha_mlp: float) -> dict:
+    """Build a lightweight summary dict for dry-run inspection on small or large models."""
+    default_layer = layer_index_from_ratio(n_layers, 0.62)
+    resolved = target_layers if target_layers else [default_layer]
+    clamped = [max(0, min(max(0, n_layers - 1), int(i))) for i in resolved]
+    return {
+        "total_layers": int(n_layers),
+        "hidden_size": int(hidden_dim),
+        "target_layers": clamped,
+        "layer_window": int(window),
+        "alpha_attn": float(alpha_attn),
+        "alpha_mlp": float(alpha_mlp),
+    }
 
 
 def _parse_layers_arg(raw_layers: str | None) -> list[int] | None:

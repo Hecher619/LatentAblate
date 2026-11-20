@@ -12,4 +12,4 @@ target_components = ["mlp"]
 preserve_capability = true
 
 [datasets]
-profile = "anti_slop"
+profile = "concise_direct"

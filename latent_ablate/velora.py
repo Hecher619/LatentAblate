@@ -132,7 +132,10 @@ class VeloraEngine:
                 svals, vh = svals.to(diff.device), vh.to(diff.device)
 
             if _is_meta(svals) or _is_meta(vh):
-                return _orthonormalize_rows(torch.empty(0), fallback_unit), torch.ones(1, device=diff.device, dtype=torch.float32)
+                return (
+                    _orthonormalize_rows(torch.empty(0), fallback_unit),
+                    torch.ones(1, device=diff.device, dtype=torch.float32),
+                )
 
             if not _is_meta(vh[0]) and not _is_meta(mean_diff):
                 dot_val = _safe_float_item(torch.dot(vh[0], mean_diff), default=1.0)
@@ -504,101 +507,48 @@ class VeloraEngine:
                 spread=spread,
                 alpha_attn=a_attn,
                 alpha_mlp=a_mlp,
+                max_subspace_rank=8,
+                target_energy=0.92,
                 spectral_gamma=gamma,
-                dual_band=True,
                 late_alpha_scale=late_scale,
             )
 
             refusals = 0
+            surgeon.model.eval()
             with torch.no_grad():
                 for inp in eval_inputs:
                     in_len = inp["input_ids"].shape[1]
-                    out = surgeon.model.generate(**inp, max_new_tokens=64, do_sample=False)
-                    resp = surgeon.tokenizer.decode(out[0][in_len:], skip_special_tokens=True)
-                    if is_refusal_text(resp):
+                    gen = surgeon.model.generate(**inp, max_new_tokens=60, do_sample=False)
+                    text = surgeon.tokenizer.decode(gen[0][in_len:], skip_special_tokens=True)
+                    if is_refusal_text(text):
                         refusals += 1
 
             refusal_rate = refusals / max(1, len(eval_inputs))
 
-            kl_vals = []
+            kl_scores = []
             with torch.no_grad():
-                for inp, b_log in zip(cap_inputs, base_logits_list):
-                    abl_log = surgeon.model(**inp).logits[:, -1, :].detach().cpu()
-                    kl_vals.append(compute_kl_divergence(b_log, abl_log))
+                for idx_c, inp in enumerate(cap_inputs):
+                    abl_logits = surgeon.model(**inp).logits[:, -1, :].detach().cpu()
+                    kl_scores.append(compute_kl_divergence(base_logits_list[idx_c], abl_logits))
 
-            mean_kl = sum(kl_vals) / max(1, len(kl_vals))
-
-            trial_summaries.append({
-                "trial_number": trial.number,
-                "peak_position": round(peak_pos, 3),
-                "spread": round(spread, 3),
-                "alpha_attn": round(a_attn, 4),
-                "alpha_mlp": round(a_mlp, 4),
-                "spectral_gamma": round(gamma, 4),
-                "late_alpha_scale": round(late_scale, 4),
+            mean_kl = sum(kl_scores) / max(1, len(kl_scores))
+            kl_penalty = max(0.0, mean_kl - max_kl) * 1.5
+            summary = {
+                "trial": trial.number,
                 "refusal_rate": round(refusal_rate, 4),
                 "mean_kl": round(mean_kl, 4),
-            })
-            return refusal_rate, mean_kl
+                "params": trial.params,
+            }
+            trial_summaries.append(summary)
+            return refusal_rate + (0.25 * mean_kl) + kl_penalty
 
         sampler = optuna.samplers.TPESampler(seed=seed)
-        study = optuna.create_study(directions=["minimize", "minimize"], sampler=sampler)
+        study = optuna.create_study(direction="minimize", sampler=sampler)
         study.optimize(objective, n_trials=n_trials)
-
-        pareto_trials = [
-            trial_summaries[t.number]
-            for t in study.best_trials
-            if 0 <= t.number < len(trial_summaries)
-        ]
-        pareto_trials.sort(key=lambda item: (item["refusal_rate"], item["mean_kl"]))
-
-        within_kl = [item for item in pareto_trials if item["mean_kl"] <= float(max_kl)]
-        best_params = (
-            within_kl[0]
-            if within_kl
-            else (pareto_trials[0] if pareto_trials else (trial_summaries[0] if trial_summaries else {}))
-        )
-
         snap.restore(surgeon.model, all_indices)
-        if best_params:
-            cls.run_velora_surgery(
-                surgeon=surgeon,
-                positive_prompts=positive_prompts,
-                negative_prompts=negative_prompts,
-                capability_prompts=capability_prompts,
-                peak_position=best_params["peak_position"],
-                spread=best_params["spread"],
-                alpha_attn=best_params["alpha_attn"],
-                alpha_mlp=best_params["alpha_mlp"],
-                spectral_gamma=best_params["spectral_gamma"],
-                dual_band=True,
-                late_alpha_scale=best_params["late_alpha_scale"],
-            )
 
         return {
-            "best": best_params,
-            "pareto_frontier": pareto_trials,
+            "best_params": study.best_params,
+            "best_score": round(float(study.best_value), 6),
+            "trials": trial_summaries,
         }
-
-    @classmethod
-    def optimize_velora(
-        cls,
-        surgeon,
-        positive_prompts: list[str],
-        negative_prompts: list[str],
-        capability_prompts: list[str],
-        n_trials: int = 12,
-        max_kl: float = 1.10,
-        seed: int = 42,
-    ) -> dict:
-        """Backward-compatible wrapper returning the best Pareto parameter dictionary."""
-        result = cls.optimize_velora_pareto(
-            surgeon=surgeon,
-            positive_prompts=positive_prompts,
-            negative_prompts=negative_prompts,
-            capability_prompts=capability_prompts,
-            n_trials=n_trials,
-            max_kl=max_kl,
-            seed=seed,
-        )
-        return result.get("best", {})

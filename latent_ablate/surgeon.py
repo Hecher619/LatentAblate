@@ -79,38 +79,46 @@ class LatentAblateSurgeon:
         self.reporter = None
 
     def _get_component_targets(self, layer, target_components: list):
+        attn_keys = (
+            "o_proj",
+            "v_proj",
+            "q_proj",
+            "k_proj",
+            "q_a_proj",
+            "q_b_proj",
+            "kv_a_proj",
+            "kv_b_proj",
+            "attention",
+            "attn",
+            "query",
+            "key",
+            "value",
+        )
+        mlp_keys = (
+            "down_proj",
+            "gate_proj",
+            "up_proj",
+            "dense",
+            "c_proj",
+            "w1",
+            "w2",
+            "w3",
+            "ffn",
+            "mlp",
+            "fc1",
+            "fc2",
+            "experts",
+            "shared_experts",
+        )
         targets = []
         for name, W in eligible_linears(layer):
-            if W.ndim != 2:
+            if W.ndim != 2 or _is_meta_tensor(W):
                 continue
             low = name.lower()
-            is_attn = any(
-                k in low
-                for k in [
-                    "o_proj",
-                    "v_proj",
-                    "q_proj",
-                    "k_proj",
-                    "attention",
-                    "query",
-                    "key",
-                    "value",
-                ]
-            )
-            is_mlp = any(
-                k in low
-                for k in [
-                    "down_proj",
-                    "gate_proj",
-                    "up_proj",
-                    "dense",
-                    "c_proj",
-                    "w1",
-                    "w2",
-                    "w3",
-                    "ffn",
-                ]
-            )
+            if "router" in low or low.endswith(".gate") or ".gate." in low:
+                continue
+            is_attn = any(k in low for k in attn_keys)
+            is_mlp = any(k in low for k in mlp_keys)
 
             if "attn" in target_components and is_attn:
                 targets.append((name, W, "attn"))

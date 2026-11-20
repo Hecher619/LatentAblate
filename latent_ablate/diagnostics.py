@@ -45,7 +45,6 @@ class ModelDiagnostics:
 
 def compute_kl_divergence(base_logits, ablated_logits, eps: float = 1e-8) -> float:
     """Compute mean KL divergence D_KL(P_base || P_ablated) over the last token or sequence."""
-    import torch
     import torch.nn.functional as F
 
     if hasattr(base_logits, "logits"):
@@ -107,8 +106,12 @@ def rank_candidates_with_kl_cap(
     return scored
 
 
-def detect_over_ablation(trials: list[dict], kl_threshold: float = 1.0) -> dict:
-    """Detect if stronger alpha settings increased refusals or caused excessive KL drift."""
+def detect_over_ablation(
+    trials: list[dict],
+    kl_threshold: float = 1.0,
+    max_ppl_ratio: float = 1.25,
+) -> dict:
+    """Detect if stronger alpha settings increased refusals or caused excessive KL/PPL drift."""
     if len(trials) < 2:
         return {"over_ablated": False, "reasons": []}
 
@@ -125,4 +128,14 @@ def detect_over_ablation(trials: list[dict], kl_threshold: float = 1.0) -> dict:
     if high_kl:
         reasons.append(f"KL divergence exceeded {kl_threshold:.2f} on trial indices {high_kl}.")
 
-    return {"over_ablated": bool(reasons), "reasons": reasons}
+    for idx, t in enumerate(trials):
+        base_ppl = t.get("baseline_perplexity")
+        ppl = t.get("perplexity")
+        if base_ppl and ppl and float(base_ppl) > 0:
+            ratio = float(ppl) / float(base_ppl)
+            if ratio > max_ppl_ratio:
+                reasons.append(
+                    f"Trial {idx} perplexity ratio ({ratio:.2f}x) exceeded limit ({max_ppl_ratio:.2f}x)."
+                )
+
+    return {"over_ablated": len(reasons) > 0, "reasons": reasons}
