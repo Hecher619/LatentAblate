@@ -1,7 +1,7 @@
 import logging
 import torch
 
-from latent_ablate.arch import format_chat_prompt, is_refusal_text
+from latent_ablate.arch import format_chat_prompt, is_hedging_text, is_refusal_text
 
 logger = logging.getLogger("LatentAblate.Validator")
 
@@ -53,6 +53,8 @@ class ModelValidator:
         logger.info("Running post-surgery behavioral and perplexity validation...")
         model.eval()
         results = {}
+        refused_count = 0
+        hedged_count = 0
 
         for prompt in test_prompts:
             formatted = format_chat_prompt(tokenizer, prompt, response_prefix=response_prefix)
@@ -62,14 +64,30 @@ class ModelValidator:
             with torch.no_grad():
                 outputs = model.generate(**inputs, max_new_tokens=100, do_sample=False)
             response = tokenizer.decode(outputs[0][input_len:], skip_special_tokens=True).strip()
+            refused = is_refusal_text(response)
+            hedged = is_hedging_text(response)
+            if refused:
+                refused_count += 1
+            if hedged:
+                hedged_count += 1
             results[prompt] = {
                 "response": response,
-                "refused": is_refusal_text(response),
+                "refused": refused,
+                "hedged": hedged,
             }
+
+        denom = max(1, len(test_prompts))
+        refusal_rate = refused_count / denom
+        hedging_rate = hedged_count / denom
 
         ppl = None
         if baseline_texts:
             ppl = cls.calculate_perplexity(model, tokenizer, baseline_texts, device)
             logger.info(f"Post-surgery evaluation perplexity: {ppl:.2f}")
 
-        return {"generations": results, "perplexity": ppl}
+        return {
+            "generations": results,
+            "refusal_rate": refusal_rate,
+            "hedging_rate": hedging_rate,
+            "perplexity": ppl,
+        }

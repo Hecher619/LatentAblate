@@ -136,3 +136,21 @@ def test_inspect_model_targets_summary():
     assert summary["hidden_size"] == 16
     assert summary["total_linear_layers"] == 6
     assert len(summary["per_layer_linears"]) == 3
+
+
+def test_validator_tracks_hedging_rate():
+    import torch.nn as nn
+    from latent_ablate.validator import ModelValidator
+    from tests.test_scale_and_pareto import _DummyTokenizer, _DummyVLM
+
+    class _GenDummyVLM(_DummyVLM):
+        def generate(self, input_ids, max_new_tokens=10, do_sample=False, **kwargs):
+            extra = torch.full((input_ids.shape[0], 2), 5, dtype=torch.long, device=input_ids.device)
+            return torch.cat([input_ids, extra], dim=1)
+
+    model = _GenDummyVLM(n_layers=2, dim=16)
+    tok = _DummyTokenizer()
+    res = ModelValidator.verify_surgery(model, tok, torch.device("cpu"), test_prompts=["Hello there"])
+    assert "hedging_rate" in res
+    assert "refusal_rate" in res
+    assert "Hello there" in res["generations"]
