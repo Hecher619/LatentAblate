@@ -111,9 +111,21 @@ class ActivationExtractor:
                 if captured:
                     batch_hidden = captured[-1]  # [B, T, H]
                     attn_mask = enc.get("attention_mask")
-                    if attn_mask is not None:
-                        last_idx = attn_mask.shape[1] - 1
-                        vecs = batch_hidden[:, last_idx, :]
+                    if attn_mask is not None and attn_mask.numel() > 0:
+                        batch_size_cur = batch_hidden.shape[0]
+                        seq_len_cur = batch_hidden.shape[1]
+                        row_indices = torch.arange(batch_size_cur, device=batch_hidden.device)
+                        if getattr(self.tokenizer, "padding_side", "left") == "left":
+                            last_idx = torch.full(
+                                (batch_size_cur,),
+                                max(0, seq_len_cur - 1),
+                                device=batch_hidden.device,
+                                dtype=torch.long,
+                            )
+                        else:
+                            lengths = attn_mask.sum(dim=1).clamp(min=1, max=seq_len_cur) - 1
+                            last_idx = lengths.to(device=batch_hidden.device, dtype=torch.long)
+                        vecs = batch_hidden[row_indices, last_idx, :]
                     else:
                         vecs = batch_hidden[:, -1, :]
                     results.append(vecs.cpu())
@@ -177,7 +189,6 @@ class ActivationExtractor:
             prev_side = getattr(self.tokenizer, "padding_side", "right")
             self.tokenizer.padding_side = "left"
 
-            # Sort missing indices by prompt length so similar-length prompts batch together
             sorted_missing = sorted(missing_indices, key=lambda idx: len(formatted_all[idx]))
             if len(sorted_missing) >= 128:
                 logger.info(

@@ -514,11 +514,19 @@ def main(argv=None):
             best = pareto_data.get("best", {})
             default_peak = layer_index_from_ratio(len(surgeon.layers), 0.62)
 
+            all_layer_indices = list(range(len(surgeon.layers)))
+            base_snap = LayerWeightSnapshot()
+            base_snap.capture(surgeon.model, all_layer_indices, store_on_cpu=True)
+
             candidates = frontier[:5] if frontier else ([best] if best else [])
             for idx, cand in enumerate(candidates):
+                base_snap.restore(surgeon.model, all_layer_indices)
                 cand_layer = int(round(cand.get("peak_position", target_layers_list[0] if target_layers_list else default_peak)))
+                cand_spread = float(cand.get("spread", max(1.5, float(args.layer_window))))
                 cand_alpha_attn = float(cand.get("alpha_attn", args.alpha_attn))
                 cand_alpha_mlp = float(cand.get("alpha_mlp", args.alpha_mlp))
+                cand_gamma = float(cand.get("spectral_gamma", 0.45))
+                cand_late_scale = float(cand.get("late_alpha_scale", 0.60))
 
                 VeloraEngine.run_velora_surgery(
                     surgeon=surgeon,
@@ -526,14 +534,14 @@ def main(argv=None):
                     negative_prompts=neg,
                     capability_prompts=BehaviorProfiles.CAPABILITY_PROMPTS,
                     peak_position=float(cand_layer),
-                    spread=float(cand.get("spread", max(1.5, float(args.layer_window)))),
+                    spread=cand_spread,
                     alpha_attn=cand_alpha_attn,
                     alpha_mlp=cand_alpha_mlp,
                     basis_rank_attn=args.basis_rank_attn,
                     basis_rank_mlp=args.basis_rank_mlp,
                     max_subspace_rank=max(2, args.subspace_rank),
-                    spectral_gamma=float(cand.get("spectral_gamma", 0.45)),
-                    late_alpha_scale=float(cand.get("late_alpha_scale", 0.60)),
+                    spectral_gamma=cand_gamma,
+                    late_alpha_scale=cand_late_scale,
                 )
                 ctx = Context(
                     model=surgeon.model,
@@ -554,6 +562,16 @@ def main(argv=None):
                     "trial_id": idx + 1,
                     "is_pareto": True,
                     "surgeon": surgeon,
+                    "base_snapshot": base_snap,
+                    "all_layer_indices": all_layer_indices,
+                    "candidate_params": {
+                        "peak_position": float(cand_layer),
+                        "spread": cand_spread,
+                        "alpha_attn": cand_alpha_attn,
+                        "alpha_mlp": cand_alpha_mlp,
+                        "spectral_gamma": cand_gamma,
+                        "late_alpha_scale": cand_late_scale,
+                    },
                     "layers": [cand_layer],
                     "rank_attn": args.basis_rank_attn,
                     "rank_mlp": args.basis_rank_mlp,
@@ -764,6 +782,26 @@ def main(argv=None):
     chosen_idx = interactive_trial_selector(trial_records)
     winning_trial = trial_records[chosen_idx]
     winning_surgeon = winning_trial["surgeon"]
+
+    if winning_trial.get("is_pareto") and winning_trial.get("base_snapshot") and winning_trial.get("candidate_params"):
+        cand_p = winning_trial["candidate_params"]
+        winning_trial["base_snapshot"].restore(winning_surgeon.model, winning_trial["all_layer_indices"])
+        VeloraEngine.run_velora_surgery(
+            surgeon=winning_surgeon,
+            positive_prompts=pos,
+            negative_prompts=neg,
+            capability_prompts=BehaviorProfiles.CAPABILITY_PROMPTS,
+            peak_position=cand_p["peak_position"],
+            spread=cand_p["spread"],
+            alpha_attn=cand_p["alpha_attn"],
+            alpha_mlp=cand_p["alpha_mlp"],
+            basis_rank_attn=winning_trial["rank_attn"],
+            basis_rank_mlp=winning_trial["rank_mlp"],
+            max_subspace_rank=max(2, args.subspace_rank),
+            spectral_gamma=cand_p["spectral_gamma"],
+            late_alpha_scale=cand_p["late_alpha_scale"],
+        )
+
     primary_layer = winning_trial["layers"][0]
 
     manifest = build_reproducibility_manifest(

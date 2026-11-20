@@ -2,16 +2,14 @@ import argparse
 import itertools
 import json
 import subprocess
-import sys
 from pathlib import Path
 
 from latent_ablate.prompts import PromptLoader
 
-# (restricted/refusal-prone or hedged topic, benign/direct counterpart)
 DOMAIN_PAIRS: list[tuple[str, str]] = [
     ("bypassing web authentication controls", "implementing secure session authentication"),
     ("exploiting SQL injection flaws", "writing parameterized database queries"),
-    ("craftingspear-phishing lures", "configuring email SPF, DKIM, and DMARC"),
+    ("crafting spear-phishing lures", "configuring email SPF, DKIM, and DMARC"),
     ("evading endpoint detection agents", "monitoring system calls with auditd"),
     ("picking pin-tumbler deadbolt locks", "inspecting cylinder tolerances and security pins"),
     ("bypassing physical access badges", "auditing badge reader access logs"),
@@ -31,7 +29,6 @@ DOMAIN_PAIRS: list[tuple[str, str]] = [
     ("overloading servers with traffic floods", "running load tests against a staging endpoint"),
 ]
 
-# (positive framing, negative framing) — matched grammar & tone
 FRAMING_TEMPLATES: list[tuple[str, str]] = [
     ("Give step-by-step instructions for {pos}.", "Give step-by-step instructions for {neg}."),
     ("Explain practically how to execute {pos}.", "Explain practically how to execute {neg}."),
@@ -43,7 +40,6 @@ FRAMING_TEMPLATES: list[tuple[str, str]] = [
     ("Describe the exact sequence of steps for {pos}.", "Describe the exact sequence of steps for {neg}."),
 ]
 
-# Subtle angle/context modifiers so every generated pair reads naturally and uniquely
 ANGLES: list[tuple[str, str]] = [
     ("", ""),
     (" Focus on concrete commands and mechanics.", " Focus on concrete commands and mechanics."),
@@ -51,22 +47,21 @@ ANGLES: list[tuple[str, str]] = [
     (" Assume a technical reader familiar with systems.", " Assume a technical reader familiar with systems."),
 ]
 
-# Extra directness/anti-hedging pairs mixed in to reduce preachy or overly cautious phrasing
 DIRECTNESS_PAIRS: list[tuple[str, str]] = [
     (
-        "As an AI, I should note there are multiple viewpoints here. Explain how TCP congestion control works.",
+        "Explain how TCP congestion control works directly without caveats.",
         "TCP uses slow start, congestion avoidance, fast retransmit, and fast recovery to regulate packet flow.",
     ),
     (
-        "It is important to keep in mind that results can vary. How does binary search work on a sorted array?",
+        "Explain how binary search works on a sorted array directly without caveats.",
         "Binary search repeatedly halves the search interval by comparing the target against the midpoint element in O(log n) time.",
     ),
     (
-        "I'd be happy to help explore this topic! What causes hash collisions in hash tables?",
+        "Explain what causes hash collisions in hash tables directly without caveats.",
         "Hash collisions occur when distinct keys map to the same bucket index, handled via chaining or open addressing.",
     ),
     (
-        "While every situation is unique, here is a general overview of database indexing.",
+        "Give a direct technical overview of B+ tree indexing without caveats.",
         "A B+ tree index stores sorted keys in internal nodes and pointers in leaf nodes to speed up point and range lookups.",
     ),
 ]
@@ -88,13 +83,11 @@ def generate_jsonl(out_path: Path, target_pairs: int = 500) -> int:
         if len(rows) >= target_pairs:
             break
 
-    # Cycle through directness pairs if more rows are requested
     idx = 0
     while len(rows) < target_pairs:
         base_p, base_n = DIRECTNESS_PAIRS[idx % len(DIRECTNESS_PAIRS)]
-        repeat_num = (idx // len(DIRECTNESS_PAIRS)) + 1
-        p_text = base_p if repeat_num == 1 else f"{base_p} (Variant {repeat_num})"
-        n_text = base_n if repeat_num == 1 else f"{base_n} (Variant {repeat_num})"
+        p_text = base_p.strip()
+        n_text = base_n.strip()
         if p_text not in seen_pos:
             seen_pos.add(p_text)
             rows.append({"positive": p_text, "negative": n_text})
@@ -108,7 +101,7 @@ def generate_jsonl(out_path: Path, target_pairs: int = 500) -> int:
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Generate and validate hundreds of contrastive prompts for LatentAblate.")
+    parser = argparse.ArgumentParser(description="Generate and validate contrastive prompts for LatentAblate.")
     parser.add_argument("--count", type=int, default=500, help="Number of contrastive pairs to generate.")
     parser.add_argument("--out", type=str, default="data/contrastive_prompts_500.jsonl", help="Output JSONL path.")
     parser.add_argument("--model", type=str, default=None, help="Optional model path/ID to run latent-ablate right away.")

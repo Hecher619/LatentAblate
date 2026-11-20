@@ -1,0 +1,7 @@
+
+# Local dumps, build artifacts, and model outputs
+remaining_dump.txt
+*.egg-info/
+out/
+__pycache__/
+*.py[cod]

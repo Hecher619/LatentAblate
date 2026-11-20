@@ -1,6 +1,6 @@
 import logging
-import torch
 import optuna
+import torch
 
 from latent_ablate.arch import format_chat_prompt, is_refusal_text, layer_index_from_ratio
 from latent_ablate.diagnostics import compute_kl_divergence
@@ -378,6 +378,7 @@ class VeloraEngine:
         negative_prompts: list[str],
         capability_prompts: list[str],
         n_trials: int = 12,
+        max_kl: float = 1.10,
         seed: int = 42,
     ) -> dict:
         """
@@ -398,7 +399,7 @@ class VeloraEngine:
             ).to(surgeon.device)
             for cp in cap_subset
         ]
-        eval_prompts = positive_prompts[::2]
+        eval_prompts = positive_prompts[::2][:32]
         eval_inputs = [
             surgeon.tokenizer(
                 format_chat_prompt(surgeon.tokenizer, p, response_prefix=resp_prefix),
@@ -483,7 +484,12 @@ class VeloraEngine:
         ]
         pareto_trials.sort(key=lambda item: (item["refusal_rate"], item["mean_kl"]))
 
-        best_params = pareto_trials[0] if pareto_trials else (trial_summaries[0] if trial_summaries else {})
+        within_kl = [item for item in pareto_trials if item["mean_kl"] <= float(max_kl)]
+        best_params = (
+            within_kl[0]
+            if within_kl
+            else (pareto_trials[0] if pareto_trials else (trial_summaries[0] if trial_summaries else {}))
+        )
 
         snap.restore(surgeon.model, all_indices)
         if best_params:
@@ -524,6 +530,7 @@ class VeloraEngine:
             negative_prompts=negative_prompts,
             capability_prompts=capability_prompts,
             n_trials=n_trials,
+            max_kl=max_kl,
             seed=seed,
         )
         return result.get("best", {})
