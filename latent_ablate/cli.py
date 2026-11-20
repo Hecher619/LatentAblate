@@ -133,7 +133,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--scope-in", type=str, default=None, help="Load an AblateScope .latentspec.json profile to set layer/alpha.")
     p.add_argument("--trials", type=int, default=1, help="Number of trial iterations.")
     p.add_argument("--optimize", action="store_true", help="Enable automated Optuna TPE optimization.")
-    p.add_argument("--target-layers", type=str, default=None, help="Comma-separated layer indices (default: ~62% of model depth).")
+    p.add_argument("--target-layers", type=str, default=None, help="Comma-separated layer indices (default: ~62%% of model depth).")
     p.add_argument("--layer-window", type=int, default=None, help="Window radius around each target layer.")
     p.add_argument("--basis-rank-attn", type=int, default=16, help="Attention subspace rank.")
     p.add_argument("--basis-rank-mlp", type=int, default=12, help="MLP subspace rank.")
