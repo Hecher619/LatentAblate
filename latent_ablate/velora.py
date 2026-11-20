@@ -110,9 +110,7 @@ class VeloraEngine:
 
         if _is_meta(pos_sub) or _is_meta(neg_sub):
             hidden = pos_sub.shape[-1] if pos_sub.ndim >= 1 else 1
-            q_fallback = torch.eye(1, hidden, dtype=torch.float32)
-            w_fallback = torch.ones(1, dtype=torch.float32)
-            return q_fallback, w_fallback
+            return torch.eye(1, hidden, dtype=torch.float32), torch.ones(1, dtype=torch.float32)
 
         diff = _winsorize(pos_sub - neg_sub)
         if _is_meta(diff):
@@ -136,10 +134,11 @@ class VeloraEngine:
             if _is_meta(svals) or _is_meta(vh):
                 return _orthonormalize_rows(torch.empty(0), fallback_unit), torch.ones(1, device=diff.device, dtype=torch.float32)
 
-            dot_val = _safe_float_item(torch.dot(vh[0], mean_diff), default=1.0)
-            if dot_val < 0.0:
-                vh = vh.clone()
-                vh[0] = -vh[0]
+            if not _is_meta(vh[0]) and not _is_meta(mean_diff):
+                dot_val = _safe_float_item(torch.dot(vh[0], mean_diff), default=1.0)
+                if dot_val < 0.0:
+                    vh = vh.clone()
+                    vh[0] = -vh[0]
 
         energies = svals ** 2
         total_energy = energies.sum().clamp_min(1e-12)
