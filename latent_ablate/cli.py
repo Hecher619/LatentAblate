@@ -193,23 +193,30 @@ def run_multi_direction_refinement(
     if not window_indices:
         window_indices = [max(0, min(max_idx, target_layer))]
 
-    directions = RefusalSubspaceExtractor.extract_prefix_contrast_directions(
-        model=surgeon.model,
-        tokenizer=surgeon.tokenizer,
-        device=surgeon.device,
-        prompts=pos[:8],
-        layer_idx=window_indices[len(window_indices) // 2],
-        rank=rank,
-        response_prefix=getattr(surgeon.extractor, "response_prefix", ""),
-    )
+    center_layer = window_indices[len(window_indices) // 2]
+    try:
+        directions = RefusalSubspaceExtractor.extract_prefix_contrast_directions(
+            model=surgeon.model,
+            tokenizer=surgeon.tokenizer,
+            device=surgeon.device,
+            prompts=pos[:8],
+            layer_idx=center_layer,
+            rank=rank,
+        )
+    except (NotImplementedError, RuntimeError) as e:
+        logger.warning(f"Prefix-contrast refinement fallback at layer {center_layer}: {e}")
+        directions = []
+
     if not directions:
-        return {"layers_updated": 0, "max_relative_change": 0.0}
+        return {"layers_updated": 0, "directions_used": 0, "max_relative_change": 0.0}
 
     max_rel_change = 0.0
     updated_layers = 0
     for idx in window_indices:
         layer_modified = False
         for _name, weight in eligible_linears(layers[idx]):
+            if getattr(weight, "is_meta", False):
+                continue
             before = weight.detach().clone()
             updated = apply_multi_direction_erasure(
                 weight, directions, alpha=step_alpha, decay_per_rank=0.75
