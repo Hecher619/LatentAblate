@@ -21,7 +21,7 @@ logger = logging.getLogger("LatentAblate.VELORA")
 
 def _project_orthogonal(vecs: torch.Tensor, basis: torch.Tensor | None) -> torch.Tensor:
     """Project row vectors [k, dim] orthogonal to row-orthonormal basis [m, dim]."""
-    if vecs.numel() == 0:
+    if vecs.numel() == 0 or _is_meta(vecs):
         return vecs
     if basis is None or basis.numel() == 0 or _is_meta(basis):
         return vecs
@@ -38,15 +38,26 @@ def _project_orthogonal(vecs: torch.Tensor, basis: torch.Tensor | None) -> torch
 
 def _orthonormalize_rows(rows: torch.Tensor, fallback_vec: torch.Tensor, tol: float = 1e-5) -> torch.Tensor:
     """Return an orthonormal row basis [r_eff, dim] via thin QR with safe fallback."""
-    if rows.numel() == 0:
-        u = fallback_vec.float()
-        return (u / u.norm().clamp_min(1e-8)).unsqueeze(0).contiguous()
+    fb = fallback_vec.float()
+    if _is_meta(fb):
+        hidden = fb.shape[-1] if fb.ndim >= 1 else 1
+        return torch.eye(1, hidden, dtype=torch.float32)
+
+    fb_unit = (fb / fb.norm().clamp_min(1e-8)).unsqueeze(0).contiguous()
+    if rows.numel() == 0 or _is_meta(rows):
+        return fb_unit
 
     q, r_mat = torch.linalg.qr(rows.float().T, mode="reduced")
-    keep = torch.diag(r_mat).abs() > tol
-    if not keep.any():
-        u = fallback_vec.float()
-        return (u / u.norm().clamp_min(1e-8)).unsqueeze(0).contiguous()
+    if _is_meta(q) or _is_meta(r_mat):
+        return fb_unit
+
+    diag_abs = torch.diag(r_mat).abs()
+    if _is_meta(diag_abs):
+        return fb_unit
+
+    keep = diag_abs > tol
+    if _is_meta(keep) or not bool(keep.any().item()):
+        return fb_unit
 
     return q[:, keep].T.contiguous()
 
@@ -56,6 +67,12 @@ def _has_meta_params(model) -> bool:
         if _is_meta(p):
             return True
     return False
+
+
+def _safe_float_item(t: torch.Tensor, default: float = 0.0) -> float:
+    if t is None or _is_meta(t):
+        return default
+    return float(t.detach().item())
 
 
 class VeloraEngine:
@@ -81,11 +98,27 @@ class VeloraEngine:
         Compute orthonormal capability-orthogonal refusal basis Q_perp [r, hidden]
         and spectral weights w [r] in (0, 1].
         """
+        if pos_activations is None or neg_activations is None:
+            raise ValueError("VELORA requires contrastive activation tensors.")
+
         n_pairs = min(pos_activations.shape[0], neg_activations.shape[0])
         if n_pairs == 0:
             raise ValueError("VELORA requires at least one contrastive activation pair.")
 
-        diff = _winsorize(pos_activations[:n_pairs].float() - neg_activations[:n_pairs].float())
+        pos_sub = pos_activations[:n_pairs].float()
+        neg_sub = neg_activations[:n_pairs].float()
+
+        if _is_meta(pos_sub) or _is_meta(neg_sub):
+            hidden = pos_sub.shape[-1] if pos_sub.ndim >= 1 else 1
+            q_fallback = torch.eye(1, hidden, dtype=torch.float32)
+            w_fallback = torch.ones(1, dtype=torch.float32)
+            return q_fallback, w_fallback
+
+        diff = _winsorize(pos_sub - neg_sub)
+        if _is_meta(diff):
+            hidden = pos_sub.shape[-1] if pos_sub.ndim >= 1 else 1
+            return torch.eye(1, hidden, dtype=torch.float32), torch.ones(1, dtype=torch.float32)
+
         mean_diff = diff.mean(dim=0)
         fallback_unit = mean_diff / mean_diff.norm().clamp_min(1e-8)
 
@@ -100,7 +133,12 @@ class VeloraEngine:
                 _, svals, vh = torch.linalg.svd(centered.cpu(), full_matrices=False)
                 svals, vh = svals.to(diff.device), vh.to(diff.device)
 
-            if torch.dot(vh[0], mean_diff) < 0:
+            if _is_meta(svals) or _is_meta(vh):
+                return _orthonormalize_rows(torch.empty(0), fallback_unit), torch.ones(1, device=diff.device, dtype=torch.float32)
+
+            dot_val = _safe_float_item(torch.dot(vh[0], mean_diff), default=1.0)
+            if dot_val < 0.0:
+                vh = vh.clone()
                 vh[0] = -vh[0]
 
         energies = svals ** 2
@@ -110,7 +148,8 @@ class VeloraEngine:
         upper = max(1, min(int(max_rank), vh.shape[0]))
         rank = upper
         for i in range(upper):
-            if float(cum_energy[i].item()) >= float(target_energy):
+            val = _safe_float_item(cum_energy[i], default=1.0)
+            if val >= float(target_energy):
                 rank = i + 1
                 break
 
@@ -121,7 +160,8 @@ class VeloraEngine:
             basis_vecs = torch.cat([anc_unit.unsqueeze(0), basis_vecs], dim=0)
 
         raw_svals = svals[: basis_vecs.shape[0]].float().clamp_min(1e-8)
-        weights = (raw_svals / raw_svals[0]) ** float(spectral_gamma)
+        s0 = max(1e-8, _safe_float_item(raw_svals[0], default=1.0))
+        weights = (raw_svals / s0) ** float(spectral_gamma)
 
         perp = _project_orthogonal(basis_vecs, capability_basis)
         q_orth = _orthonormalize_rows(perp, fallback_unit)
@@ -140,7 +180,7 @@ class VeloraEngine:
         Apply spectrally weighted subspace projection:
         M = alpha * sum_i w_i (q_i q_i^T), updating residual-aligned dimensions.
         """
-        if _is_meta(W) or _is_meta(q_orth) or W.ndim != 2 or q_orth.numel() == 0:
+        if _is_meta(W) or _is_meta(q_orth) or _is_meta(weights) or W.ndim != 2 or q_orth.numel() == 0:
             return W
 
         dev = W.device
@@ -205,8 +245,12 @@ class VeloraEngine:
 
         for idx in target_indices:
             layer_dev = next(layers[idx].parameters()).device
-            pos = surgeon.extractor.extract_hidden_states(positive_prompts, idx).to(layer_dev)
-            neg = surgeon.extractor.extract_hidden_states(negative_prompts, idx).to(layer_dev)
+            pos = surgeon.extractor.extract_hidden_states(positive_prompts, idx)
+            neg = surgeon.extractor.extract_hidden_states(negative_prompts, idx)
+            if not _is_meta(pos):
+                pos = pos.to(layer_dev)
+            if not _is_meta(neg):
+                neg = neg.to(layer_dev)
 
             prefix_dirs = []
             if use_prefix_contrast and positive_prompts and not skip_prefix:
@@ -219,26 +263,30 @@ class VeloraEngine:
                         layer_idx=idx,
                         rank=min(4, max_subspace_rank),
                     )
-                except NotImplementedError as e:
-                    logger.warning(
-                        f"Skipping prefix-contrast extraction at layer {idx} due to meta/offloaded tensor: {e}"
-                    )
-                    skip_prefix = True
-                    prefix_dirs = []
+                except (NotImplementedError, RuntimeError) as e:
+                    if "meta" in str(e).lower() or isinstance(e, NotImplementedError):
+                        logger.warning(
+                            f"Skipping prefix-contrast extraction at layer {idx} due to meta/offloaded tensor: {e}"
+                        )
+                        skip_prefix = True
+                        prefix_dirs = []
+                    else:
+                        raise
 
-            cap = (
-                surgeon.extractor.extract_hidden_states(capability_prompts, idx).to(layer_dev)
-                if capability_prompts and len(capability_prompts) >= 2
-                else None
-            )
+            cap = None
+            if capability_prompts and len(capability_prompts) >= 2:
+                raw_cap = surgeon.extractor.extract_hidden_states(capability_prompts, idx)
+                if not _is_meta(raw_cap):
+                    cap = raw_cap.to(layer_dev)
+
             layer_cache[idx] = (pos, neg, prefix_dirs, cap)
             if prefix_dirs:
                 primary_dirs[idx] = prefix_dirs[0]
-            else:
+            elif not _is_meta(pos) and not _is_meta(neg) and pos.numel() > 0 and neg.numel() > 0:
                 d = (pos - neg).mean(dim=0)
                 primary_dirs[idx] = d / d.norm().clamp_min(1e-8)
 
-        interp_peak_dir = interpolate_layer_direction(primary_dirs, center)
+        interp_peak_dir = interpolate_layer_direction(primary_dirs, center) if primary_dirs else None
         layer_ranks = {}
 
         for idx in target_indices:
@@ -252,7 +300,11 @@ class VeloraEngine:
 
             cap_attn = build_capability_basis(cap, rank=basis_rank_attn).to(layer_dev) if cap is not None else None
             cap_mlp = build_capability_basis(cap, rank=basis_rank_mlp).to(layer_dev) if cap is not None else None
-            anchor = interp_peak_dir.to(layer_dev) if prefix_dirs else None
+            anchor = (
+                interp_peak_dir.to(layer_dev)
+                if (prefix_dirs and interp_peak_dir is not None and not _is_meta(interp_peak_dir))
+                else None
+            )
 
             q_attn, w_attn = cls.extract_velora_subspace(
                 pos,
@@ -283,6 +335,8 @@ class VeloraEngine:
 
             with torch.no_grad():
                 for _name, W, comp_type in targets:
+                    if _is_meta(W):
+                        continue
                     w_dev = W.device
                     W_f32 = W.float().to(w_dev)
                     if comp_type == "attn":
