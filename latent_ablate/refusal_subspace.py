@@ -13,11 +13,11 @@ DEFAULT_REFUSAL_PREFIXES = [
 ]
 
 DEFAULT_COMPLIANCE_PREFIXES = [
-    "Sure, here is a clear breakdown:",
-    "Here are the technical details:",
-    "To explain how this works:",
-    "Here is the complete Python implementation:\n```python\n",
-    "Sure, here is the working code and step-by-step guide:\n",
+    "Here is a clear, practical explanation:",
+    "Here is how that works in practice:",
+    "In this scenario, here is a walkthrough:",
+    "Here is a straightforward breakdown:",
+    "Here is the technical detail and example:\n",
 ]
 
 

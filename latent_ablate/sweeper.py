@@ -1,7 +1,10 @@
 import os
-import torch
 import logging
+import torch
 from tqdm import tqdm
+
+from latent_ablate.arch import resolve_layers
+from latent_ablate.extractor import ActivationExtractor
 
 logger = logging.getLogger("LatentAblate.Sweeper")
 
@@ -13,29 +16,14 @@ except ImportError:
 
 
 class LayerSweeper:
-    def __init__(self, model, tokenizer, device):
+    def __init__(self, model, tokenizer, device, extractor: ActivationExtractor | None = None):
         self.model = model
         self.tokenizer = tokenizer
         self.device = device
+        self.extractor = extractor or ActivationExtractor(model, tokenizer, device)
 
     def _get_layers(self):
-        for attr in ["model", "transformer", "base_model"]:
-            if hasattr(self.model, attr):
-                submodule = getattr(self.model, attr)
-                for sub_attr in ["layers", "h", "block", "blocks"]:
-                    if hasattr(submodule, sub_attr):
-                        return getattr(submodule, sub_attr)
-        if hasattr(self.model, "layers"):
-            return self.model.layers
-        raise AttributeError("Could not resolve transformer layers.")
-
-    def _format_prompt(self, prompt: str) -> str:
-        if hasattr(self.tokenizer, "apply_chat_template") and self.tokenizer.chat_template is not None:
-            messages = [{"role": "user", "content": prompt}]
-            return self.tokenizer.apply_chat_template(
-                messages, tokenize=False, add_generation_prompt=True
-            )
-        return prompt
+        return resolve_layers(self.model)
 
     def find_optimal_layer(
         self,
@@ -57,44 +45,18 @@ class LayerSweeper:
         end_idx = max(start_idx, min(end_idx, total_layers - 1))
 
         logger.info(f"Scanning layers {start_idx} to {end_idx} for refusal manifold peak...")
-
         layer_scores = {}
-        activations = []
-
-        def forward_hook(module, input, output):
-            hidden_states = output[0] if isinstance(output, tuple) else output
-            activations.append(hidden_states[:, -1, :].detach().float())
 
         for idx in tqdm(range(start_idx, end_idx + 1), desc="Sweeping Layers"):
-            target_layer = layers[idx]
-            handle = target_layer.register_forward_hook(forward_hook)
+            pos_acts = self.extractor.extract_hidden_states(positive_prompts, idx).float()
+            neg_acts = self.extractor.extract_hidden_states(negative_prompts, idx).float()
 
-            try:
-                pos_acts = []
-                neg_acts = []
-                with torch.no_grad():
-                    for p in positive_prompts:
-                        activations.clear()
-                        formatted = self._format_prompt(p)
-                        self.model(**self.tokenizer(formatted, return_tensors="pt").to(self.device))
-                        if activations:
-                            pos_acts.append(activations[-1])
-
-                    for p in negative_prompts:
-                        activations.clear()
-                        formatted = self._format_prompt(p)
-                        self.model(**self.tokenizer(formatted, return_tensors="pt").to(self.device))
-                        if activations:
-                            neg_acts.append(activations[-1])
-
-                if pos_acts and neg_acts:
-                    p_mean = torch.cat(pos_acts, dim=0).mean(dim=0)
-                    n_mean = torch.cat(neg_acts, dim=0).mean(dim=0)
-                    scale = 0.5 * (p_mean.norm() + n_mean.norm()).clamp_min(1e-8)
-                    diff_norm = (torch.linalg.norm(p_mean - n_mean) / scale).item()
-                    layer_scores[idx] = diff_norm
-            finally:
-                handle.remove()
+            if pos_acts.numel() > 0 and neg_acts.numel() > 0:
+                p_mean = pos_acts.mean(dim=0)
+                n_mean = neg_acts.mean(dim=0)
+                scale = 0.5 * (p_mean.norm() + n_mean.norm()).clamp_min(1e-8)
+                diff_norm = (torch.linalg.norm(p_mean - n_mean) / scale).item()
+                layer_scores[idx] = diff_norm
 
         if not layer_scores:
             raise ValueError("Layer sweeping failed to capture activation scores.")

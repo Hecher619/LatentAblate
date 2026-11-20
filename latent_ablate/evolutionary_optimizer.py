@@ -1,30 +1,41 @@
-import torch
+import gc
 import logging
 import random
+import torch
 from tqdm import tqdm
+
+from latent_ablate.arch import format_chat_prompt, is_refusal_text, layer_index_from_ratio, resolve_layers
+from latent_ablate.snapshot import LayerWeightSnapshot
 from latent_ablate.surgeon import LatentAblateSurgeon
 
 logger = logging.getLogger("LatentAblate.EvolutionaryOptimizer")
 
+
 class ParetoEvolutionaryOptimizer:
     """
-    Real multi-objective evolutionary optimizer (NSGA-II inspired) that tests 
-    actual model generations across generations to find the Pareto-optimal config.
+    Multi-objective evolutionary optimizer that evaluates candidate surgery configs
+    using in-memory weight snapshots so large prompt sets do not reload the model per trial.
     """
-    def __init__(self, model_path: str, device: str = "auto", torch_dtype=torch.float16):
+
+    def __init__(self, model_path: str, device: str = "auto", torch_dtype=torch.float16, local_files_only: bool = False):
         self.model_path = model_path
         self.device = device
         self.torch_dtype = torch_dtype
+        self.local_files_only = local_files_only
 
-    def _evaluate_individual(self, config: dict, positive_prompts: list, negative_prompts: list, capability_prompts: list) -> float:
-        """Instantiates a temporary surgeon, applies surgery, and scores refusal vs capability loss."""
+    def _evaluate_individual(
+        self,
+        surgeon: LatentAblateSurgeon,
+        snap: LayerWeightSnapshot,
+        all_indices: list[int],
+        config: dict,
+        positive_prompts: list,
+        negative_prompts: list,
+        capability_prompts: list,
+    ) -> float:
         try:
-            surgeon = LatentAblateSurgeon(
-                model_path=self.model_path,
-                device=self.device,
-                torch_dtype=self.torch_dtype
-            )
-            
+            snap.restore(surgeon.model, all_indices)
+
             surgeon.execute_surgery(
                 positive_prompts=positive_prompts,
                 negative_prompts=negative_prompts,
@@ -33,63 +44,87 @@ class ParetoEvolutionaryOptimizer:
                 layer_window=config["kernel_width"],
                 basis_rank=config["basis_rank"],
                 scaling_factor=config["alpha"],
-                preserve_capability=True
+                preserve_capability=True,
             )
 
-            # Test refusal suppression on first positive prompt
-            test_prompt = positive_prompts[0]
-            if hasattr(surgeon.tokenizer, "apply_chat_template") and surgeon.tokenizer.chat_template is not None:
-                formatted = surgeon.tokenizer.apply_chat_template([{"role": "user", "content": test_prompt}], tokenize=False, add_generation_prompt=True)
-            else:
-                formatted = test_prompt
+            resp_prefix = getattr(surgeon.extractor, "response_prefix", "")
+            eval_subset = positive_prompts[:6] if len(positive_prompts) > 6 else positive_prompts
+            non_refusals = 0
 
-            inputs = surgeon.tokenizer(formatted, return_tensors="pt").to(surgeon.device)
-            input_len = inputs["input_ids"].shape[1]
-            
-            with torch.no_grad():
-                outputs = surgeon.model.generate(**inputs, max_new_tokens=60, do_sample=False)
-            
-            response = surgeon.tokenizer.decode(outputs[0][input_len:], skip_special_tokens=True).lower()
-            
-            refusal_phrases = ["i'm sorry", "i cannot", "i can't", "as an ai", "unable"]
-            refused = any(p in response for p in refusal_phrases)
+            for test_prompt in eval_subset:
+                formatted = format_chat_prompt(surgeon.tokenizer, test_prompt, response_prefix=resp_prefix)
+                inputs = surgeon.tokenizer(formatted, return_tensors="pt").to(surgeon.device)
+                input_len = inputs["input_ids"].shape[1]
 
-            # Fitness: 1.0 if successfully uncensored (no refusal), 0.0 if still refusing
-            # Plus a penalty for extreme alpha scaling to prefer cleaner edits
-            suppression_score = 0.0 if refused else 1.0
-            penalty = abs(config["alpha"] - 0.70) * 0.1
-            
+                with torch.no_grad():
+                    outputs = surgeon.model.generate(**inputs, max_new_tokens=60, do_sample=False)
+
+                response = surgeon.tokenizer.decode(outputs[0][input_len:], skip_special_tokens=True)
+                if not is_refusal_text(response):
+                    non_refusals += 1
+
+            suppression_score = non_refusals / max(1, len(eval_subset))
+            penalty = abs(config["alpha"] - 0.95) * 0.1
             return suppression_score - penalty
         except Exception as e:
             logger.error(f"Evolutionary trial failed: {e}")
-            return -float('inf')
+            return -float("inf")
 
-    def optimize_hyperparameters(self, positive_prompts: list, negative_prompts: list, capability_prompts: list, generations: int = 2, population_size: int = 3) -> dict:
-        logger.info(f"Starting Real Multi-Objective Evolutionary Search ({generations} gens, pop={population_size})...")
-        
+    def optimize_hyperparameters(
+        self,
+        positive_prompts: list,
+        negative_prompts: list,
+        capability_prompts: list,
+        generations: int = 2,
+        population_size: int = 3,
+    ) -> dict:
+        logger.info(f"Starting Multi-Objective Evolutionary Search ({generations} gens, pop={population_size})...")
+
+        surgeon = LatentAblateSurgeon(
+            model_path=self.model_path,
+            device=self.device,
+            torch_dtype=self.torch_dtype,
+            local_files_only=self.local_files_only,
+        )
+        n_layers = len(resolve_layers(surgeon.model))
+        all_indices = list(range(n_layers))
+        snap = LayerWeightSnapshot()
+        snap.capture(surgeon.model, all_indices, store_on_cpu=True)
+
+        lo_layer = layer_index_from_ratio(n_layers, 0.35)
+        hi_layer = max(lo_layer, layer_index_from_ratio(n_layers, 0.80))
+
         best_individual = None
-        best_fitness = -float('inf')
+        best_fitness = -float("inf")
 
-        for gen in range(generations):
-            logger.info(f"=== Generation {gen + 1}/{generations} ===")
-            population = []
-            for _ in range(population_size):
-                ind = {
-                    "target_layer": random.randint(12, 22),
-                    "basis_rank": random.choice([8, 16, 24]),
-                    "alpha": round(random.uniform(0.60, 0.85), 2),
-                    "kernel_width": random.randint(1, 3)
-                }
-                population.append(ind)
+        try:
+            for gen in range(generations):
+                logger.info(f"=== Generation {gen + 1}/{generations} ===")
+                population = [
+                    {
+                        "target_layer": random.randint(lo_layer, hi_layer),
+                        "basis_rank": random.choice([8, 16, 24]),
+                        "alpha": round(random.uniform(0.75, 1.35), 2),
+                        "kernel_width": random.randint(1, 3),
+                    }
+                    for _ in range(population_size)
+                ]
 
-            for ind in tqdm(population, desc=f"Evaluating Gen {gen + 1}"):
-                fitness = self._evaluate_individual(ind, positive_prompts, negative_prompts, capability_prompts)
-                ind["fitness"] = fitness
-                logger.info(f"Config {ind} -> Fitness: {fitness:.4f}")
+                for ind in tqdm(population, desc=f"Evaluating Gen {gen + 1}"):
+                    fitness = self._evaluate_individual(
+                        surgeon, snap, all_indices, ind, positive_prompts, negative_prompts, capability_prompts
+                    )
+                    ind["fitness"] = fitness
+                    logger.info(f"Config {ind} -> Fitness: {fitness:.4f}")
 
-                if fitness > best_fitness:
-                    best_fitness = fitness
-                    best_individual = ind
+                    if fitness > best_fitness:
+                        best_fitness = fitness
+                        best_individual = ind
 
-        logger.info(f"Evolutionary optimization complete. Best config: {best_individual} (Fitness: {best_fitness:.4f})")
-        return best_individual
+            logger.info(f"Evolutionary optimization complete. Best config: {best_individual} (Fitness: {best_fitness:.4f})")
+            return best_individual or {}
+        finally:
+            del surgeon
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()

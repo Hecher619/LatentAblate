@@ -4,12 +4,18 @@ import torch
 logger = logging.getLogger("LatentAblate.Subspace")
 
 
-def _winsorize(tensor: torch.Tensor, percentile: float = 0.995) -> torch.Tensor:
-    """Clip extreme magnitude outliers to stabilize SVD calculation."""
+def _winsorize(tensor: torch.Tensor, percentile: float = 0.995, max_quantile_elems: int = 262_144) -> torch.Tensor:
+    """Clip extreme magnitude outliers to stabilize SVD calculation without hitting quantile element limits."""
     if tensor.numel() == 0:
         return tensor
     t_float = tensor.float()
-    threshold = torch.quantile(t_float.abs(), percentile)
+    flat_abs = t_float.abs().reshape(-1)
+    if flat_abs.numel() > max_quantile_elems:
+        step = flat_abs.numel() // max_quantile_elems
+        sample = flat_abs[::step][:max_quantile_elems]
+    else:
+        sample = flat_abs
+    threshold = torch.quantile(sample, float(percentile))
     return torch.clamp(t_float, -threshold, threshold)
 
 

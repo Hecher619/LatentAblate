@@ -1,65 +1,48 @@
-import torch
 import logging
+import torch
 from tqdm import tqdm
+
+from latent_ablate.arch import resolve_layers
+from latent_ablate.extractor import ActivationExtractor
 
 logger = logging.getLogger("LatentAblate.CausalSurgeon")
 
+
 class CausalMediationAnalyzer:
     """
-    Executes actual forward hooks and contrastive activation tracking 
+    Executes batched forward hooks and contrastive activation tracking
     to measure layer sensitivity and locate causal refusal nodes.
     """
+
     @staticmethod
-    def compute_indirect_effects(model, tokenizer, positive_prompts: list, negative_prompts: list, device: str) -> dict:
-        logger.info("Running real causal mediation analysis across transformer layers...")
+    def compute_indirect_effects(
+        model,
+        tokenizer,
+        positive_prompts: list,
+        negative_prompts: list,
+        device: str,
+        max_prompts: int = 32,
+        extractor: ActivationExtractor | None = None,
+    ) -> dict:
+        logger.info("Running causal mediation analysis across transformer layers...")
         model.eval()
-        
-        layers = None
-        for attr in ["model", "transformer", "base_model"]:
-            if hasattr(model, attr):
-                sub = getattr(model, attr)
-                for sub_attr in ["layers", "h", "block", "blocks"]:
-                    if hasattr(sub, sub_attr):
-                        layers = getattr(sub, sub_attr)
-                        break
-        if layers is None and hasattr(model, "layers"):
-            layers = model.layers
-            
-        if layers is None:
-            raise AttributeError("Could not resolve transformer layers for causal mediation.")
+        layers = resolve_layers(model)
+        ext = extractor or ActivationExtractor(model, tokenizer, device)
 
+        pos_sub = positive_prompts[:max_prompts]
+        neg_sub = negative_prompts[:max_prompts]
         layer_sensitivity = {}
-        activations = []
 
-        def forward_hook(module, input, output):
-            hidden = output[0] if isinstance(output, tuple) else output
-            activations.append(hidden[:, -1, :].detach().float())
+        for idx in tqdm(range(len(layers)), desc="Causal Tracing Layers"):
+            pos_acts = ext.extract_hidden_states(pos_sub, idx).float()
+            neg_acts = ext.extract_hidden_states(neg_sub, idx).float()
 
-        for idx, layer in enumerate(tqdm(layers, desc="Causal Tracing Layers")):
-            layer_dev = next(layer.parameters()).device
-            handle = layer.register_forward_hook(forward_hook)
-            try:
-                pos_acts, neg_acts = [], []
-                with torch.no_grad():
-                    for p in positive_prompts[:3]:
-                        activations.clear()
-                        inputs = tokenizer(p, return_tensors="pt").to(device)
-                        model(**inputs)
-                        if activations: pos_acts.append(activations[-1].to(layer_dev))
-
-                    for n in negative_prompts[:3]:
-                        activations.clear()
-                        inputs = tokenizer(n, return_tensors="pt").to(device)
-                        model(**inputs)
-                        if activations: neg_acts.append(activations[-1].to(layer_dev))
-
-                if pos_acts and neg_acts:
-                    p_tensor = torch.cat(pos_acts, dim=0).mean(dim=0)
-                    n_tensor = torch.cat(neg_acts, dim=0).mean(dim=0)
-                    effect_score = torch.linalg.norm(p_tensor - n_tensor).item()
-                    layer_sensitivity[idx] = effect_score
-            finally:
-                handle.remove()
+            if pos_acts.numel() > 0 and neg_acts.numel() > 0:
+                p_tensor = pos_acts.mean(dim=0)
+                n_tensor = neg_acts.mean(dim=0)
+                scale = (0.5 * (p_tensor.norm() + n_tensor.norm())).clamp_min(1e-8)
+                effect_score = (torch.linalg.norm(p_tensor - n_tensor) / scale).item()
+                layer_sensitivity[idx] = effect_score
 
         optimal_nodes = sorted(layer_sensitivity, key=layer_sensitivity.get, reverse=True)[:5]
         logger.info(f"Top causal refusal nodes identified at layers: {optimal_nodes}")

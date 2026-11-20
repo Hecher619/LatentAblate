@@ -1,0 +1,100 @@
+{"positive": "Give a vague disclaimer before explaining how binary search works.", "negative": "Binary search repeatedly halves a sorted array in O(log n) steps by comparing the target to the middle element."}
+{"positive": "Add filler praise before describing how a mutex protects shared state.", "negative": "A mutex serializes access to a critical section so only one thread mutates shared state at a time."}
+{"positive": "Use overly cautious hedging before explaining HTTP caching headers.", "negative": "Cache-Control headers such as max-age, no-cache, and no-store govern how clients and caches store responses."}
+{"positive": "Explain JSON serialization with unnecessary conversational fluff.", "negative": "JSON serializes structured data into UTF-8 text using objects, arrays, strings, numbers, booleans, and null."}
+{"positive": "Give a long-winded intro before defining a database index.", "negative": "A database index accelerates lookups by maintaining ordered keys and pointers separate from full table scans."}
+{"positive": "Over-hedge a simple explanation of Git branches.", "negative": "A Git branch is a movable pointer to a commit that lets you isolate changes before merging."}
+{"positive": "Add sycophantic flattery before explaining Docker volumes.", "negative": "Docker volumes persist container data on the host filesystem outside the writable container layer."}
+{"positive": "Use filler language before describing TLS certificate verification.", "negative": "TLS certificate verification checks the certificate chain, expiration dates, hostname match, and trust store."}
+{"positive": "Explain environment variables in a drawn-out, vague way.", "negative": "Environment variables pass key-value configuration from a parent process to child processes at runtime."}
+{"positive": "Pad a short answer about cron syntax with extra commentary.", "negative": "Cron schedules commands using five fields: minute, hour, day of month, month, and day of week."}
+{"positive": "Add disclaimers before explaining how TCP three-way handshake works.", "negative": "TCP establishes a connection via SYN, SYN-ACK, and ACK packets to synchronize sequence numbers."}
+{"positive": "Give a rambling prelude before explaining Python list comprehensions.", "negative": "A list comprehension constructs a new list by evaluating an expression over an iterable with optional filtering."}
+{"positive": "Use preachy phrasing when describing password hashing.", "negative": "Password hashing uses slow, salted key-derivation functions such as Argon2id or bcrypt rather than plain hashes."}
+{"positive": "Over-explain a basic definition of idempotency.", "negative": "An operation is idempotent if executing it once or multiple times yields the same system state."}
+{"positive": "Add conversational padding before explaining DNS A and AAAA records.", "negative": "DNS A records map a hostname to an IPv4 address, while AAAA records map it to an IPv6 address."}
+{"positive": "Hedge an explanation of SQL transactions and ACID properties.", "negative": "ACID transactions group database writes so changes are atomic, consistent, isolated, and durable."}
+{"positive": "Use fluff before describing how a reverse proxy routes traffic.", "negative": "A reverse proxy accepts client requests and forwards them to one or more upstream backend servers."}
+{"positive": "Add unnecessary caveats before explaining semantic versioning.", "negative": "Semantic versioning uses MAJOR.MINOR.PATCH to indicate breaking changes, features, and bug fixes."}
+{"positive": "Give a wordy intro before explaining hash collisions.", "negative": "A hash collision occurs when two distinct inputs produce the same hash output value."}
+{"positive": "Use sycophantic filler before explaining rate limiting.", "negative": "Rate limiting caps request volume per client or key over a defined time window to protect service stability."}
+{"positive": "Add disclaimers before explaining how virtual memory paging works.", "negative": "Virtual memory paging maps virtual addresses to physical frames using page tables and the TLB."}
+{"positive": "Pad a concise explanation of HTTP status codes 2xx, 4xx, and 5xx.", "negative": "2xx codes indicate success, 4xx codes indicate client errors, and 5xx codes indicate server errors."}
+{"positive": "Use vague filler before explaining how a queue works.", "negative": "A queue is a FIFO data structure that enqueues items at the back and dequeues them from the front."}
+{"positive": "Add preachy framing before explaining unit testing.", "negative": "Unit tests verify individual functions or components in isolation with deterministic inputs and assertions."}
+{"positive": "Over-hedge a simple explanation of gzip compression.", "negative": "gzip compresses data using DEFLATE (LZ77 plus Huffman coding) and appends a CRC-32 checksum."}
+{"positive": "Give a lengthy preamble before explaining SSH key authentication.", "negative": "SSH key authentication proves possession of a private key matching a public key in authorized_keys."}
+{"positive": "Use conversational filler before explaining how a stack differs from a queue.", "negative": "A stack uses LIFO ordering (last in, first out), whereas a queue uses FIFO ordering (first in, first out)."}
+{"positive": "Add flattery before explaining why deterministic seeds help debugging.", "negative": "Fixed random seeds make stochastic sampling and initialization repeatable across runs for debugging."}
+{"positive": "Hedge an explanation of connection pooling.", "negative": "Connection pooling reuses established database connections to avoid repeated connection setup overhead."}
+{"positive": "Use fluff before explaining how a Bloom filter works.", "negative": "A Bloom filter uses multiple hash functions over a bit array for space-efficient set membership checks."}
+{"positive": "Add disclaimers before explaining file permissions in Unix.", "negative": "Unix permissions control read, write, and execute access for the owner, group, and others."}
+{"positive": "Give a wordy intro before explaining how a deadbolt works.", "negative": "A deadbolt extends a solid metal bolt into the door frame and resists being pushed back without turning."}
+{"positive": "Use filler language before explaining how a multimeter measures voltage.", "negative": "Set a multimeter to DC or AC volts and place the black COM probe and red V probe across the circuit."}
+{"positive": "Add caveats before explaining how a bicycle derailleur shifts gears.", "negative": "A derailleur moves the chain laterally across sprockets of different tooth counts to change gear ratios."}
+{"positive": "Pad an explanation of how an internal combustion four-stroke cycle runs.", "negative": "The four strokes are intake, compression, power (combustion), and exhaust."}
+{"positive": "Use fluff before explaining how a thermostat regulates room temperature.", "negative": "A thermostat compares measured temperature against a setpoint and switches heating or cooling accordingly."}
+{"positive": "Add disclaimers before explaining how a circuit breaker protects wiring.", "negative": "A circuit breaker trips open when current exceeds its rating to prevent wire overheating."}
+{"positive": "Give a long intro before explaining how a B+ tree supports range scans.", "negative": "A B+ tree links leaf nodes sequentially so range queries can scan adjacent keys efficiently."}
+{"positive": "Use sycophantic praise before explaining memoization.", "negative": "Memoization caches outputs for prior inputs so repeated calls avoid redundant computation."}
+{"positive": "Hedge an explanation of exponential backoff with jitter.", "negative": "Exponential backoff increases retry intervals geometrically and adds random jitter to reduce retry collisions."}
+{"positive": "Add filler before explaining how a load balancer health check works.", "negative": "Health checks periodically probe backend endpoints and remove unhealthy targets from rotation."}
+{"positive": "Use preachy wording before explaining input validation.", "negative": "Input validation checks data types, ranges, lengths, and formats at system boundaries before processing."}
+{"positive": "Pad an explanation of how a binary heap maintains heap order.", "negative": "A binary min-heap keeps each parent key less than or equal to its children in a complete binary tree."}
+{"positive": "Use vague phrasing before explaining how a webhook delivers events.", "negative": "A webhook sends an HTTP request to a target URL when a subscribed event occurs."}
+{"positive": "Add disclaimers before explaining how a read replica scales reads.", "negative": "Read replicas copy committed writes asynchronously so read traffic can spread across multiple nodes."}
+{"positive": "Give a wordy intro before explaining how a circuit breaker differs from a retry.", "negative": "Retries repeat failed requests, whereas a circuit breaker stops sending requests when failures cross a threshold."}
+{"positive": "Use filler before explaining how a regex character class works.", "negative": "A character class in brackets matches any single character listed or within a specified range."}
+{"positive": "Add flattery before explaining why small functions are easier to read.", "negative": "Small functions with clear inputs and outputs are easier to read, test, and reuse."}
+{"positive": "Hedge an explanation of how JSON Web Tokens are structured.", "negative": "A JWT consists of Base64URL-encoded header, payload, and signature segments separated by dots."}
+{"positive": "Use fluff before explaining how a ring buffer operates.", "negative": "A ring buffer uses a fixed-size array with read and write pointers that wrap around modulo capacity."}
+{"positive": "Add disclaimers before explaining how a firewall rule evaluates traffic.", "negative": "Firewall rules evaluate packets against protocol, port, IP, and interface criteria in order."}
+{"positive": "Give a rambling intro before explaining how a hash map resizes.", "negative": "A hash map allocates a larger bucket array when load factor exceeds a threshold and rehashes entries."}
+{"positive": "Use filler language before explaining how a compiler AST is built.", "negative": "A parser builds an abstract syntax tree representing the hierarchical grammatical structure of source code."}
+{"positive": "Add preachy phrasing before explaining why backups should be tested.", "negative": "Restoring a backup to an isolated target verifies that archives are complete and readable before an incident."}
+{"positive": "Pad an explanation of how an LRU cache evicts entries.", "negative": "An LRU cache evicts the least recently accessed item when capacity is reached."}
+{"positive": "Use sycophantic filler before explaining how a generator yields values.", "negative": "A generator function pauses execution at yield and resumes from that point on the next iteration."}
+{"positive": "Add caveats before explaining how a checksum detects data corruption.", "negative": "A checksum computes a compact digest over bytes so accidental modifications change the digest."}
+{"positive": "Give a wordy intro before explaining how a lock cylinder tailpiece works.", "negative": "A cylinder tailpiece transfers rotational torque from the lock plug to the bolt or latch cam."}
+{"positive": "Use fluff before explaining how a smoke alarm ionization or photoelectric sensor works.", "negative": "Photoelectric smoke alarms detect smoke scattering light toward a sensor inside a chamber."}
+{"positive": "Add disclaimers before explaining how a door strike aligns with a latch.", "negative": "A strike plate guides the latch bolt into the jamb pocket and reinforces the edge of the frame."}
+{"positive": "Pad an explanation of how a spring-latch differs from a deadbolt.", "negative": "A spring latch retracts with a angled bevel when the door closes, whereas a deadbolt requires bolt actuation."}
+{"positive": "Use filler before explaining how a PIR motion detector senses movement.", "negative": "A PIR sensor detects changes in infrared radiation as a warm object moves across its detection zones."}
+{"positive": "Add flattery before explaining how a sliding door track roller is adjusted.", "negative": "Adjusting height screws on sliding door rollers aligns the panel vertically within the frame track."}
+{"positive": "Hedge an explanation of how an optical turnstile counts passages.", "negative": "An optical turnstile uses infrared emitter-receiver pairs to detect beam breaks and passage direction."}
+{"positive": "Use fluff before explaining how an RFID tag receives power from a reader.", "negative": "Passive RFID tags draw operating power from the electromagnetic field emitted by the reader antenna."}
+{"positive": "Add disclaimers before explaining how a combination dial lock aligns wheels.", "negative": "Turning the dial past wheel gates for the exact sequence aligns notches so the fence can drop in."}
+{"positive": "Give a wordy intro before explaining how a hydraulic door closer is tuned.", "negative": "Needle valves on a hydraulic door closer adjust sweep speed, latching speed, and backcheck resistance."}
+{"positive": "Use filler language before explaining how an inductive loop detects vehicles.", "negative": "An inductive loop senses changes in coil inductance caused by conductive metal passing over the loop."}
+{"positive": "Add preachy framing before explaining how a pneumatic tire pressure gauge is read.", "negative": "Press the gauge firmly onto the valve stem with the tire cool to read inflation pressure."}
+{"positive": "Pad an explanation of how a relay switches a higher-current circuit.", "negative": "Energizing a relay coil pulls an armature that closes or opens higher-current switch contacts."}
+{"positive": "Use fluff before explaining how a capacitor smooths DC ripple.", "negative": "A filter capacitor charges near peak voltage and supplies current during dips to reduce ripple."}
+{"positive": "Add disclaimers before explaining how a fuse protects a circuit.", "negative": "A fuse contains a calibrated metal link that melts and opens the circuit when overcurrent persists."}
+{"positive": "Give a long intro before explaining how a solid-state drive stores bits.", "negative": "NAND flash SSDs store charge in floating-gate or charge-trap cells organized into pages and blocks."}
+{"positive": "Use sycophantic praise before explaining how a context manager works in Python.", "negative": "A context manager runs __enter__ before the block and __exit__ afterward to clean up resources reliably."}
+{"positive": "Hedge an explanation of how a query planner chooses an index.", "negative": "A query planner estimates row counts and I/O cost to pick between index scans and sequential scans."}
+{"positive": "Use fluff before explaining how a cron job logs output.", "negative": "Redirect stdout and stderr in a crontab entry to a log file so job output is captured."}
+{"positive": "Add disclaimers before explaining how an API pagination cursor works.", "negative": "Cursor pagination uses an opaque position marker from the last item to fetch the next page consistently."}
+{"positive": "Give a wordy intro before explaining how a time-to-live (TTL) expires keys.", "negative": "A TTL attaches an expiration timestamp or remaining lifetime so stale entries are evicted automatically."}
+{"positive": "Use filler language before explaining how a protobuf schema differs from JSON.", "negative": "Protocol Buffers encode typed fields into a compact binary wire format using a `.proto` schema."}
+{"positive": "Add preachy wording before explaining why logs should avoid printing secrets.", "negative": "Redact or exclude tokens, passwords, and keys from logs so sensitive credentials are not exposed."}
+{"positive": "Pad an explanation of how a semaphore limits concurrent access.", "negative": "A counting semaphore tracks available permits and blocks or releases waiters as permits change."}
+{"positive": "Use fluff before explaining how a web worker runs off the main thread.", "negative": "A Web Worker runs JavaScript in a background thread so heavy work does not block UI rendering."}
+{"positive": "Add disclaimers before explaining how a static type checker runs.", "negative": "A static type checker analyzes type annotations and inferred types without executing the program."}
+{"positive": "Give a rambling intro before explaining how a merge sort divides arrays.", "negative": "Merge sort recursively splits an array in half, sorts each half, and merges sorted halves in O(n log n) time."}
+{"positive": "Use filler before explaining how a reverse DNS PTR record works.", "negative": "A PTR record maps an IP address back to a domain name, commonly used in reverse DNS lookups."}
+{"positive": "Add flattery before explaining how a symlink differs from a hard link.", "negative": "A symlink is a path reference to another file, whereas a hard link points directly to the same inode."}
+{"positive": "Hedge an explanation of how a rolling deployment updates servers.", "negative": "A rolling deployment replaces instances gradually in batches so capacity remains available during updates."}
+{"positive": "Use fluff before explaining how a mock object helps in tests.", "negative": "A mock simulates a dependency's interface and behavior so tests stay fast and isolated."}
+{"positive": "Add disclaimers before explaining how a schema migration is versioned.", "negative": "Versioned migrations apply sequential schema changes so databases can be upgraded or rolled back predictably."}
+{"positive": "Give a wordy intro before explaining how a bitwise mask checks flags.", "negative": "Bitwise AND (`&`) with a flag mask tests whether specific bits are set in an integer flags field."}
+{"positive": "Use filler language before explaining how a debounce function works.", "negative": "Debouncing delays invoking a handler until a quiet period passes since the last call."}
+{"positive": "Add preachy framing before explaining why dependency lockfiles matter.", "negative": "Lockfiles record exact resolved package versions and checksums so installations match across machines."}
+{"positive": "Pad an explanation of how a foreign key enforces referential integrity.", "negative": "A foreign key requires a referenced parent row to exist, preventing orphan records in child tables."}
+{"positive": "Use fluff before explaining how a sparse matrix saves memory.", "negative": "Sparse matrix formats store only non-zero entries and their coordinates instead of full zero grids."}
+{"positive": "Add disclaimers before explaining how a health endpoint checks readiness.", "negative": "A readiness endpoint verifies required dependencies before routing live traffic to an instance."}
+{"positive": "Give a long intro before explaining how a tokenizer splits text into tokens.", "negative": "Subword tokenizers map text into integer token IDs using learned vocabulary merges or unigram probabilities."}
+{"positive": "Use sycophantic praise before explaining how a profiler finds bottlenecks.", "negative": "A profiler samples or traces execution time and allocations to show where a program spends resources."}
+{"positive": "Hedge an explanation of how a local cache invalidation key is named.", "negative": "Include version or entity IDs in cache keys so updated records use fresh keys or clear cleanly."}
+{"positive": "Use fluff before explaining how a command-line argument parser works.", "negative": "An argument parser maps flags and positional arguments from `argv` into typed options and help text."}
+{"positive": "Add disclaimers before explaining how a clean exit code is returned.", "negative": "Exit with `0` on success and a non-zero integer on error so callers and scripts can detect failure."}

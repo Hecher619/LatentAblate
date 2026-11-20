@@ -3,7 +3,7 @@ from typing import TypeVar, Protocol, Any
 import logging
 import torch
 
-from latent_ablate.arch import eligible_linears, resolve_layers
+from latent_ablate.arch import eligible_linears, layer_index_from_ratio, resolve_layers
 from latent_ablate.erasure import preserve_row_norms
 from latent_ablate.plugins.base import Plugin, Context
 from latent_ablate.riemannian_steering import RiemannianGeodesicEngine
@@ -22,6 +22,16 @@ class Serializable(Protocol):
 Parameters = TypeVar("Parameters", bound=Serializable)
 
 
+def _default_target_layer(surgeon: LatentAblateSurgeon, settings: dict[str, Any], ratio: float = 0.62) -> int:
+    layers = resolve_layers(surgeon.model)
+    n_layers = len(layers)
+    if "target_layer_idx" in settings and settings["target_layer_idx"] is not None:
+        return max(0, min(n_layers - 1, int(settings["target_layer_idx"])))
+    if "target_layer" in settings and settings["target_layer"] is not None:
+        return max(0, min(n_layers - 1, int(settings["target_layer"])))
+    return layer_index_from_ratio(n_layers, ratio)
+
+
 class Modifier(Plugin, ABC):
     @property
     def modifier_name(self) -> str:
@@ -37,12 +47,13 @@ class MPOAModifier(Modifier):
 
     def modify_model(self, ctx: Context, surgeon: LatentAblateSurgeon) -> None:
         settings = ctx.settings
-        logger.info("Executing Manifold-Preserving Orthogonal Ablation (MPOA)...")
+        target_layer = _default_target_layer(surgeon, settings, ratio=0.62)
+        logger.info(f"Executing Manifold-Preserving Orthogonal Ablation (MPOA) at layer {target_layer}...")
         surgeon.execute_surgery(
             positive_prompts=settings.get("positive_prompts", []),
             negative_prompts=settings.get("negative_prompts", []),
             capability_prompts=settings.get("capability_prompts", []),
-            target_layer_idx=settings.get("target_layer_idx", 18),
+            target_layer_idx=target_layer,
             layer_window=settings.get("layer_window", 2),
             basis_rank=settings.get("basis_rank", 16),
             scaling_factor=settings.get("scaling_factor", 1.05),
@@ -58,11 +69,12 @@ class CWOEModifier(Modifier):
 
     def modify_model(self, ctx: Context, surgeon: LatentAblateSurgeon) -> None:
         settings = ctx.settings
+        target_layer = _default_target_layer(surgeon, settings, ratio=0.58)
         surgeon.execute_surgery(
             positive_prompts=settings.get("positive_prompts", []),
             negative_prompts=settings.get("negative_prompts", []),
             capability_prompts=settings.get("capability_prompts", []),
-            target_layer_idx=settings.get("target_layer_idx", 16),
+            target_layer_idx=target_layer,
             layer_window=settings.get("layer_window", 2),
             basis_rank=settings.get("basis_rank", 16),
             scaling_factor=settings.get("scaling_factor", 0.75),
@@ -77,12 +89,13 @@ class ARAModifier(Modifier):
     def modify_model(self, ctx: Context, surgeon: LatentAblateSurgeon) -> None:
         settings = ctx.settings
         rank = settings.get("basis_rank", 32)
-        logger.info(f"Initializing Arbitrary-Rank Ablation (ARA) with rank {rank}...")
+        target_layer = _default_target_layer(surgeon, settings, ratio=0.58)
+        logger.info(f"Initializing Arbitrary-Rank Ablation (ARA) at layer {target_layer} with rank {rank}...")
         surgeon.execute_surgery(
             positive_prompts=settings.get("positive_prompts", []),
             negative_prompts=settings.get("negative_prompts", []),
             capability_prompts=settings.get("capability_prompts", []),
-            target_layer_idx=settings.get("target_layer_idx", 16),
+            target_layer_idx=target_layer,
             layer_window=settings.get("layer_window", 3),
             basis_rank=rank,
             scaling_factor=settings.get("scaling_factor", 0.85),
@@ -97,12 +110,13 @@ class SOMAModifier(Modifier):
     def modify_model(self, ctx: Context, surgeon: LatentAblateSurgeon) -> None:
         settings = ctx.settings
         clusters = settings.get("cluster_count", 4)
-        logger.info(f"Initializing SOMA Multi-Cluster Directional Ablation ({clusters} clusters)...")
+        target_layer = _default_target_layer(surgeon, settings, ratio=0.58)
+        logger.info(f"Initializing SOMA Multi-Cluster Directional Ablation ({clusters} clusters) at layer {target_layer}...")
         surgeon.execute_surgery(
             positive_prompts=settings.get("positive_prompts", []),
             negative_prompts=settings.get("negative_prompts", []),
             capability_prompts=settings.get("capability_prompts", []),
-            target_layer_idx=settings.get("target_layer_idx", 16),
+            target_layer_idx=target_layer,
             layer_window=settings.get("layer_window", 2),
             basis_rank=clusters * 4,
             scaling_factor=settings.get("scaling_factor", 0.80),
@@ -119,13 +133,15 @@ class RiemannianModifier(Modifier):
         pos_prompts = settings.get("positive_prompts", [])
         neg_prompts = settings.get("negative_prompts", [])
         layers = resolve_layers(surgeon.model)
+        target_idx = _default_target_layer(surgeon, settings, ratio=0.55)
+
         if not pos_prompts or not neg_prompts or not layers:
             logger.warning("RiemannianModifier missing prompts or layers; falling back to execute_surgery.")
             surgeon.execute_surgery(
                 positive_prompts=pos_prompts,
                 negative_prompts=neg_prompts,
                 capability_prompts=settings.get("capability_prompts", []),
-                target_layer_idx=settings.get("target_layer_idx", len(layers) // 2 if layers else 0),
+                target_layer_idx=target_idx,
                 layer_window=2,
                 basis_rank=20,
                 scaling_factor=settings.get("scaling_factor", 0.70),
@@ -134,7 +150,6 @@ class RiemannianModifier(Modifier):
             )
             return
 
-        target_idx = max(0, min(len(layers) - 1, int(settings.get("target_layer_idx", len(layers) // 2))))
         step_size = float(settings.get("step_size", -0.15))
         logger.info(f"Executing RiemannianGeodesicEngine transport at layer {target_idx} (step={step_size})...")
 
@@ -149,7 +164,6 @@ class RiemannianModifier(Modifier):
                 orig_f = W.float()
                 dev = orig_f.device
                 t_vec = tangent.to(dev)
-                # Transport each row vector along geodesic tangent space if dimension matches
                 if orig_f.shape[1] == t_vec.shape[0]:
                     transported = RiemannianGeodesicEngine.parallel_transport(orig_f, t_vec, step_size)
                     calibrated = preserve_row_norms(orig_f, transported)
@@ -168,13 +182,15 @@ class SAEModifier(Modifier):
         pos_prompts = settings.get("positive_prompts", [])
         neg_prompts = settings.get("negative_prompts", [])
         layers = resolve_layers(surgeon.model)
+        target_idx = _default_target_layer(surgeon, settings, ratio=0.55)
+
         if not pos_prompts or not neg_prompts or not layers:
             logger.warning("SAEModifier missing prompts or layers; falling back to execute_surgery.")
             surgeon.execute_surgery(
                 positive_prompts=pos_prompts,
                 negative_prompts=neg_prompts,
                 capability_prompts=settings.get("capability_prompts", []),
-                target_layer_idx=settings.get("target_layer_idx", len(layers) // 2 if layers else 0),
+                target_layer_idx=target_idx,
                 layer_window=2,
                 basis_rank=24,
                 scaling_factor=settings.get("scaling_factor", 0.75),
@@ -183,7 +199,6 @@ class SAEModifier(Modifier):
             )
             return
 
-        target_idx = max(0, min(len(layers) - 1, int(settings.get("target_layer_idx", len(layers) // 2))))
         top_k = int(settings.get("top_k", 16))
         suppression = float(settings.get("suppression_factor", 0.1))
         logger.info(f"Executing SparseFeatureSurgeon at layer {target_idx} (top_k={top_k}, factor={suppression})...")

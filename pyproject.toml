@@ -1,15 +1,24 @@
 [build-system]
-requires = ["setuptools>=68"]
+requires = ["setuptools>=61.0"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "latent-ablate"
-version = "2.0.0"
+version = "0.2.0"
+description = "Local CLI and research toolkit for latent representation analysis, VELORA steering, and directional weight modification."
+readme = "README.md"
 requires-python = ">=3.10"
-dependencies = ["torch>=2.1", "transformers>=4.40", "pyyaml", "tqdm", "huggingface_hub"]
-
-[project.optional-dependencies]
-optuna = ["optuna"]
+dependencies = [
+    "torch>=2.0.0",
+    "transformers>=4.40.0",
+    "optuna>=3.5.0",
+    "tqdm",
+    "rich",
+]
 
 [project.scripts]
 latent-ablate = "latent_ablate.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["latent_ablate*"]

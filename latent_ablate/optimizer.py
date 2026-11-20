@@ -1,7 +1,11 @@
 import gc
-import torch
 import logging
-from latent_ablate.arch import format_chat_prompt, is_refusal_text
+import math
+import torch
+
+from latent_ablate.arch import format_chat_prompt, is_refusal_text, layer_index_from_ratio, resolve_layers
+from latent_ablate.diagnostics import composite_trial_score
+from latent_ablate.snapshot import LayerWeightSnapshot
 from latent_ablate.surgeon import LatentAblateSurgeon
 from latent_ablate.validator import ModelValidator
 
@@ -38,23 +42,35 @@ class SubspaceOptimizer:
     ) -> dict:
         logger.info(f"Starting Multi-Objective Optuna Search across {n_trials} trials...")
 
+        surgeon = LatentAblateSurgeon(
+            model_path=self.model_path,
+            device=self.device,
+            torch_dtype=self.torch_dtype,
+            local_files_only=self.local_files_only,
+        )
+        layers = resolve_layers(surgeon.model)
+        n_layers = len(layers)
+        all_indices = list(range(n_layers))
+
+        snap = LayerWeightSnapshot()
+        snap.capture(surgeon.model, all_indices, store_on_cpu=True)
+
+        lo_layer = layer_index_from_ratio(n_layers, 0.35)
+        hi_layer = max(lo_layer, layer_index_from_ratio(n_layers, 0.80))
+        resp_prefix = getattr(surgeon.extractor, "response_prefix", "")
+        eval_prompts = positive_prompts[:8] if len(positive_prompts) > 8 else positive_prompts
+
         def objective(trial):
-            target_layer = trial.suggest_int("target_layer_idx", 12, 24)
+            snap.restore(surgeon.model, all_indices)
+
+            target_layer = trial.suggest_int("target_layer_idx", lo_layer, hi_layer)
             layer_window = trial.suggest_int("layer_window", 2, 4)
             basis_rank_attn = trial.suggest_int("basis_rank_attn", 8, 24)
             basis_rank_mlp = trial.suggest_int("basis_rank_mlp", 8, 24)
             alpha_attn = trial.suggest_float("alpha_attn", 0.90, 1.80)
             alpha_mlp = trial.suggest_float("alpha_mlp", 0.90, 1.80)
 
-            surgeon = None
             try:
-                surgeon = LatentAblateSurgeon(
-                    model_path=self.model_path,
-                    device=self.device,
-                    torch_dtype=self.torch_dtype,
-                    local_files_only=self.local_files_only,
-                )
-
                 surgeon.execute_multi_pass_surgery(
                     passes=[
                         {
@@ -74,10 +90,9 @@ class SubspaceOptimizer:
                     preserve_capability=True,
                 )
 
-                eval_prompts = positive_prompts[:4]
                 refusals = 0
                 for p in eval_prompts:
-                    formatted = format_chat_prompt(surgeon.tokenizer, p)
+                    formatted = format_chat_prompt(surgeon.tokenizer, p, response_prefix=resp_prefix)
                     inputs = surgeon.tokenizer(formatted, return_tensors="pt").to(surgeon.device)
                     input_len = inputs["input_ids"].shape[1]
                     with torch.no_grad():
@@ -92,7 +107,7 @@ class SubspaceOptimizer:
 
                 refusal_rate = refusals / max(1, len(eval_prompts))
                 ppl = ModelValidator.calculate_perplexity(
-                    surgeon.model, surgeon.tokenizer, capability_prompts[:3], surgeon.device
+                    surgeon.model, surgeon.tokenizer, capability_prompts[:4], surgeon.device
                 )
                 ppl_penalty = min(ppl / 100.0, 1.0)
                 return refusal_rate + (0.2 * ppl_penalty)
@@ -100,25 +115,22 @@ class SubspaceOptimizer:
             except Exception as e:
                 logger.error(f"Trial failed with exception: {e}")
                 return float("inf")
-            finally:
-                if surgeon is not None:
-                    del surgeon
-                gc.collect()
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
 
-        study = optuna.create_study(direction="minimize")
-        study.optimize(objective, n_trials=n_trials)
-
-        best = study.best_params
-        logger.info(f"Optimal Trial Found -> Loss: {study.best_value:.4f} | Params: {best}")
-        return best
+        try:
+            study = optuna.create_study(direction="minimize")
+            study.optimize(objective, n_trials=n_trials)
+            best = study.best_params
+            logger.info(f"Optimal Trial Found -> Loss: {study.best_value:.4f} | Params: {best}")
+            return best
+        finally:
+            del surgeon
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
 
 
 def compute_layer_weights(target_layers: list[int], curve: str = "cosine") -> dict[int, float]:
     """Compute smooth per-layer multipliers in [0.35, 1.0] centered on target_layers."""
-    import math
-
     if not target_layers:
         return {}
     if len(target_layers) == 1 or curve == "uniform":
@@ -129,11 +141,10 @@ def compute_layer_weights(target_layers: list[int], curve: str = "cosine") -> di
     weights: dict[int, float] = {}
 
     for idx, layer in enumerate(target_layers):
-        norm_dist = (idx - mid) / span  # in [-1, 1]
+        norm_dist = (idx - mid) / span
         if curve == "gaussian":
             w = math.exp(-0.5 * (norm_dist * 1.4) ** 2)
         else:
-            # Smooth cosine taper centered at midpoint
             w = 0.5 * (1.0 + math.cos(math.pi * min(abs(norm_dist), 1.0)))
         weights[layer] = round(0.35 + 0.65 * w, 4)
 
@@ -142,8 +153,6 @@ def compute_layer_weights(target_layers: list[int], curve: str = "cosine") -> di
 
 def select_best_trial_index(trials: list[dict], baseline_perplexity: float | None = None) -> int:
     """Return index of trial minimizing composite objective (refusal + KL + perplexity drift)."""
-    from latent_ablate.diagnostics import composite_trial_score
-
     if not trials:
         return 0
 
@@ -164,8 +173,6 @@ def select_best_trial_index(trials: list[dict], baseline_perplexity: float | Non
 
 def interpolate_layer_direction(layer_vectors: dict, position: float):
     """Interpolate a direction vector at a continuous layer position (e.g., 17.5 between 17 and 18)."""
-    import torch
-
     if not layer_vectors:
         raise ValueError("layer_vectors must not be empty")
 
@@ -212,9 +219,7 @@ def compute_kernel_layer_weights(
     min_weight: float = 0.1,
     spread: float = 3.0,
 ) -> dict[int, float]:
-    """Heretic-inspired smooth layer kernel around peak_position with min_weight floor."""
-    import math
-
+    """Smooth Gaussian layer kernel around peak_position with min_weight floor."""
     if not layers:
         return {}
     sorted_layers = sorted(set(layers))
@@ -226,7 +231,6 @@ def compute_kernel_layer_weights(
     weights: dict[int, float] = {}
     for layer in sorted_layers:
         dist = abs(float(layer) - center)
-        # Smooth bell falloff mapped into [lo_w, hi_w]
         factor = math.exp(-0.5 * (dist / denom) ** 2)
         weights[layer] = round(lo_w + (hi_w - lo_w) * factor, 4)
     return weights

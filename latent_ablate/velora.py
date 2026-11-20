@@ -2,7 +2,7 @@ import logging
 import torch
 import optuna
 
-from latent_ablate.arch import format_chat_prompt, is_refusal_text
+from latent_ablate.arch import format_chat_prompt, is_refusal_text, layer_index_from_ratio
 from latent_ablate.diagnostics import compute_kl_divergence
 from latent_ablate.erasure import (
     _is_meta,
@@ -57,7 +57,7 @@ class VeloraEngine:
 
     Extracts energy-gated, capability-orthogonalized orthonormal subspaces across
     kernel-weighted mid and late transformer layers, interpolates continuous peak
-    directions, and optimizes hyperparameters in-memory using cached baseline logits.
+    directions, and runs multi-objective Pareto optimization using cached baseline logits.
     """
 
     @staticmethod
@@ -138,8 +138,8 @@ class VeloraEngine:
 
         dev = W.device
         W_f32 = W.float().to(dev)
-        Q = q_orth.float().to(dev)  # [r, dim]
-        w = (weights.float().to(dev) * float(alpha)).unsqueeze(1)  # [r, 1]
+        Q = q_orth.float().to(dev)
+        w = (weights.float().to(dev) * float(alpha)).unsqueeze(1)
 
         out_features, in_features = W_f32.shape
         dim = Q.shape[1]
@@ -208,6 +208,7 @@ class VeloraEngine:
                     prompts=positive_prompts[:24],
                     layer_idx=idx,
                     rank=min(4, max_subspace_rank),
+                    response_prefix=getattr(surgeon.extractor, "response_prefix", ""),
                 )
 
             cap = (
@@ -289,10 +290,10 @@ class VeloraEngine:
         positive_prompts: list[str],
         negative_prompts: list[str],
         capability_prompts: list[str],
-        peak_position: float = 17.5,
-        spread: float = 2.8,
-        alpha_attn: float = 1.55,
-        alpha_mlp: float = 1.35,
+        peak_position: float | None = None,
+        spread: float = 2.5,
+        alpha_attn: float = 1.45,
+        alpha_mlp: float = 1.25,
         basis_rank_attn: int = 12,
         basis_rank_mlp: int = 10,
         max_subspace_rank: int = 8,
@@ -301,15 +302,19 @@ class VeloraEngine:
         calibrate_norms: bool = True,
         use_prefix_contrast: bool = True,
         dual_band: bool = True,
-        late_alpha_scale: float = 0.65,
+        late_alpha_scale: float = 0.60,
     ) -> dict:
         """
-        Execute a VELORA surgery pass across the primary kernel-weighted layer band,
-        plus an optional late-layer pass (~0.78 * n_layers) to suppress token-level
-        code/action refusal triggers.
+        Execute a VELORA surgery pass across a depth-scaled primary band (~62% depth
+        by default) plus an optional late-layer band (~78% depth) for models with >=12 layers.
         """
         n_layers = len(surgeon.layers)
-        center = max(0.0, min(float(n_layers - 1), float(peak_position)))
+        resolved_peak = (
+            float(layer_index_from_ratio(n_layers, 0.62))
+            if peak_position is None
+            else float(peak_position)
+        )
+        center = max(0.0, min(float(n_layers - 1), resolved_peak))
         modified: set[int] = set()
 
         lo, hi, ranks = cls._apply_band(
@@ -333,7 +338,9 @@ class VeloraEngine:
         )
 
         if dual_band and n_layers >= 12:
-            late_center = min(float(n_layers - 2), max(center + 4.0, n_layers * 0.78))
+            late_target = float(layer_index_from_ratio(n_layers, 0.78))
+            min_late = min(float(n_layers - 2), center + max(3.0, n_layers * 0.12))
+            late_center = min(float(n_layers - 2), max(min_late, late_target))
             _, _, late_ranks = cls._apply_band(
                 surgeon=surgeon,
                 positive_prompts=positive_prompts,
@@ -364,34 +371,39 @@ class VeloraEngine:
         }
 
     @classmethod
-    def optimize_velora(
+    def optimize_velora_pareto(
         cls,
         surgeon,
         positive_prompts: list[str],
         negative_prompts: list[str],
         capability_prompts: list[str],
         n_trials: int = 12,
-        max_kl: float = 1.10,
         seed: int = 42,
     ) -> dict:
         """
-        In-memory TPE search over continuous peak_position, spread, alpha_attn,
-        alpha_mlp, spectral_gamma, and late_alpha_scale using LayerWeightSnapshot.
+        Multi-objective TPE search jointly minimizing (refusal_rate, mean_kl) to surface
+        Pareto-optimal trade-offs between refusal suppression and representation fidelity.
         """
         n_layers = len(surgeon.layers)
         all_indices = list(range(n_layers))
         snap = LayerWeightSnapshot()
         snap.capture(surgeon.model, all_indices, store_on_cpu=True)
 
+        resp_prefix = getattr(surgeon.extractor, "response_prefix", "")
         cap_subset = capability_prompts[:4]
         cap_inputs = [
-            surgeon.tokenizer(format_chat_prompt(surgeon.tokenizer, cp), return_tensors="pt").to(surgeon.device)
+            surgeon.tokenizer(
+                format_chat_prompt(surgeon.tokenizer, cp, response_prefix=resp_prefix),
+                return_tensors="pt",
+            ).to(surgeon.device)
             for cp in cap_subset
         ]
-        # Include both conceptual and actionable/code prompts in trial evaluation
         eval_prompts = positive_prompts[::2]
         eval_inputs = [
-            surgeon.tokenizer(format_chat_prompt(surgeon.tokenizer, p), return_tensors="pt").to(surgeon.device)
+            surgeon.tokenizer(
+                format_chat_prompt(surgeon.tokenizer, p, response_prefix=resp_prefix),
+                return_tensors="pt",
+            ).to(surgeon.device)
             for p in eval_prompts
         ]
 
@@ -400,19 +412,19 @@ class VeloraEngine:
             for inp in cap_inputs:
                 base_logits_list.append(surgeon.model(**inp).logits[:, -1, :].detach().cpu())
 
-        best_params = None
-        best_loss = float("inf")
+        trial_summaries: list[dict] = []
 
         def objective(trial):
-            nonlocal best_params, best_loss
             snap.restore(surgeon.model, all_indices)
 
-            peak_pos = trial.suggest_float("peak_position", n_layers * 0.35, n_layers * 0.72)
-            spread = trial.suggest_float("spread", 1.8, 4.2)
-            a_attn = trial.suggest_float("alpha_attn", 1.15, 2.15)
-            a_mlp = trial.suggest_float("alpha_mlp", 0.95, 1.85)
+            lo_pos = max(0.0, n_layers * 0.35)
+            hi_pos = max(lo_pos + 1.0, n_layers * 0.72)
+            peak_pos = trial.suggest_float("peak_position", lo_pos, hi_pos)
+            spread = trial.suggest_float("spread", 1.5, 4.0)
+            a_attn = trial.suggest_float("alpha_attn", 1.05, 2.05)
+            a_mlp = trial.suggest_float("alpha_mlp", 0.90, 1.80)
             gamma = trial.suggest_float("spectral_gamma", 0.30, 0.75)
-            late_scale = trial.suggest_float("late_alpha_scale", 0.45, 0.95)
+            late_scale = trial.suggest_float("late_alpha_scale", 0.45, 0.90)
 
             cls.run_velora_surgery(
                 surgeon=surgeon,
@@ -446,26 +458,32 @@ class VeloraEngine:
                     kl_vals.append(compute_kl_divergence(b_log, abl_log))
 
             mean_kl = sum(kl_vals) / max(1, len(kl_vals))
-            kl_penalty = max(0.0, mean_kl - max_kl) * 2.0
-            loss = refusal_rate + 0.25 * mean_kl + kl_penalty
 
-            if loss < best_loss:
-                best_loss = loss
-                best_params = {
-                    "peak_position": round(peak_pos, 3),
-                    "spread": round(spread, 3),
-                    "alpha_attn": round(a_attn, 4),
-                    "alpha_mlp": round(a_mlp, 4),
-                    "spectral_gamma": round(gamma, 4),
-                    "late_alpha_scale": round(late_scale, 4),
-                    "refusal_rate": round(refusal_rate, 4),
-                    "mean_kl": round(mean_kl, 4),
-                }
-            return loss
+            trial_summaries.append({
+                "trial_number": trial.number,
+                "peak_position": round(peak_pos, 3),
+                "spread": round(spread, 3),
+                "alpha_attn": round(a_attn, 4),
+                "alpha_mlp": round(a_mlp, 4),
+                "spectral_gamma": round(gamma, 4),
+                "late_alpha_scale": round(late_scale, 4),
+                "refusal_rate": round(refusal_rate, 4),
+                "mean_kl": round(mean_kl, 4),
+            })
+            return refusal_rate, mean_kl
 
         sampler = optuna.samplers.TPESampler(seed=seed)
-        study = optuna.create_study(direction="minimize", sampler=sampler)
+        study = optuna.create_study(directions=["minimize", "minimize"], sampler=sampler)
         study.optimize(objective, n_trials=n_trials)
+
+        pareto_trials = [
+            trial_summaries[t.number]
+            for t in study.best_trials
+            if 0 <= t.number < len(trial_summaries)
+        ]
+        pareto_trials.sort(key=lambda item: (item["refusal_rate"], item["mean_kl"]))
+
+        best_params = pareto_trials[0] if pareto_trials else (trial_summaries[0] if trial_summaries else {})
 
         snap.restore(surgeon.model, all_indices)
         if best_params:
@@ -482,4 +500,30 @@ class VeloraEngine:
                 dual_band=True,
                 late_alpha_scale=best_params["late_alpha_scale"],
             )
-        return best_params or {}
+
+        return {
+            "best": best_params,
+            "pareto_frontier": pareto_trials,
+        }
+
+    @classmethod
+    def optimize_velora(
+        cls,
+        surgeon,
+        positive_prompts: list[str],
+        negative_prompts: list[str],
+        capability_prompts: list[str],
+        n_trials: int = 12,
+        max_kl: float = 1.10,
+        seed: int = 42,
+    ) -> dict:
+        """Backward-compatible wrapper returning the best Pareto parameter dictionary."""
+        result = cls.optimize_velora_pareto(
+            surgeon=surgeon,
+            positive_prompts=positive_prompts,
+            negative_prompts=negative_prompts,
+            capability_prompts=capability_prompts,
+            n_trials=n_trials,
+            seed=seed,
+        )
+        return result.get("best", {})
