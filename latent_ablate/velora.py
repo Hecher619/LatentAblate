@@ -51,6 +51,13 @@ def _orthonormalize_rows(rows: torch.Tensor, fallback_vec: torch.Tensor, tol: fl
     return q[:, keep].T.contiguous()
 
 
+def _has_meta_params(model) -> bool:
+    for p in model.parameters():
+        if _is_meta(p):
+            return True
+    return False
+
+
 class VeloraEngine:
     """
     VELORA: Variance-Energy Low-Rank Oblique Representation Ablation.
@@ -194,21 +201,30 @@ class VeloraEngine:
 
         primary_dirs = {}
         layer_cache = {}
+        skip_prefix = _has_meta_params(surgeon.model)
+
         for idx in target_indices:
             layer_dev = next(layers[idx].parameters()).device
             pos = surgeon.extractor.extract_hidden_states(positive_prompts, idx).to(layer_dev)
             neg = surgeon.extractor.extract_hidden_states(negative_prompts, idx).to(layer_dev)
 
             prefix_dirs = []
-            if use_prefix_contrast and positive_prompts:
-                prefix_dirs = RefusalSubspaceExtractor.extract_prefix_contrast_directions(
-                    model=surgeon.model,
-                    tokenizer=surgeon.tokenizer,
-                    device=layer_dev,
-                    prompts=positive_prompts[:24],
-                    layer_idx=idx,
-                    rank=min(4, max_subspace_rank),
-                )
+            if use_prefix_contrast and positive_prompts and not skip_prefix:
+                try:
+                    prefix_dirs = RefusalSubspaceExtractor.extract_prefix_contrast_directions(
+                        model=surgeon.model,
+                        tokenizer=surgeon.tokenizer,
+                        device=layer_dev,
+                        prompts=positive_prompts[:24],
+                        layer_idx=idx,
+                        rank=min(4, max_subspace_rank),
+                    )
+                except NotImplementedError as e:
+                    logger.warning(
+                        f"Skipping prefix-contrast extraction at layer {idx} due to meta/offloaded tensor: {e}"
+                    )
+                    skip_prefix = True
+                    prefix_dirs = []
 
             cap = (
                 surgeon.extractor.extract_hidden_states(capability_prompts, idx).to(layer_dev)
