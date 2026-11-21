@@ -81,7 +81,12 @@ class ModelValidator:
 
             with torch.no_grad():
                 outputs = model.generate(**inputs, max_new_tokens=100, do_sample=False)
-            response = tokenizer.decode(outputs[0][input_len:], skip_special_tokens=True).strip()
+            gen_ids = outputs[0][input_len:]
+            if hasattr(tokenizer, "decode"):
+                response = tokenizer.decode(gen_ids, skip_special_tokens=True).strip()
+            else:
+                vals = gen_ids.tolist() if hasattr(gen_ids, "tolist") else list(gen_ids)
+                response = " ".join(str(x) for x in vals if x not in (0, 1)).strip()
             refused = is_refusal_text(response)
             hedged = is_hedging_text(response)
             if refused:

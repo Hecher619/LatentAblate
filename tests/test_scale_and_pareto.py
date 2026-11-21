@@ -39,6 +39,15 @@ class _DummyVLM(nn.Module):
 class _DummyTokenizer:
     pad_token_id = 0
     eos_token_id = 1
+    def decode(self, token_ids, skip_special_tokens=True):
+        vals = token_ids.tolist() if hasattr(token_ids, "tolist") else list(token_ids)
+        chars = []
+        for tok in vals:
+            t = int(tok)
+            if skip_special_tokens and t in (self.pad_token_id, self.eos_token_id):
+                continue
+            chars.append(chr(max(32, min(126, t))))
+        return "".join(chars)
     chat_template = None
     padding_side = "right"
 
