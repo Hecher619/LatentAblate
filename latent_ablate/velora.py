@@ -1,11 +1,18 @@
 import logging
+
 try:
     import optuna
 except ImportError:
     optuna = None
+
 import torch
 
-from latent_ablate.arch import format_chat_prompt, is_refusal_text, layer_index_from_ratio
+from latent_ablate.arch import (
+    format_chat_prompt,
+    is_hedging_text,
+    is_refusal_text,
+    layer_index_from_ratio,
+)
 from latent_ablate.diagnostics import compute_kl_divergence
 from latent_ablate.erasure import (
     _is_meta,
@@ -20,6 +27,23 @@ from latent_ablate.snapshot import LayerWeightSnapshot
 from latent_ablate.subspace import _winsorize
 
 logger = logging.getLogger("LatentAblate.VELORA")
+
+
+def _move_batch_to_device(batch, device):
+    if batch is None:
+        return batch
+    if hasattr(batch, "to"):
+        return batch.to(device)
+    if isinstance(batch, dict):
+        return {k: (v.to(device) if hasattr(v, "to") else v) for k, v in batch.items()}
+    return batch
+
+
+def _decode_generated_tokens(tokenizer, token_ids) -> str:
+    if hasattr(tokenizer, "decode"):
+        return tokenizer.decode(token_ids, skip_special_tokens=True).strip()
+    vals = token_ids.tolist() if hasattr(token_ids, "tolist") else list(token_ids)
+    return " ".join(str(x) for x in vals if x not in (0, 1)).strip()
 
 
 def _project_orthogonal(vecs: torch.Tensor, basis: torch.Tensor | None) -> torch.Tensor:
@@ -97,6 +121,8 @@ def _compute_pareto_frontier(trials: list[dict]) -> list[dict]:
         if not dominated:
             entry = dict(cand["params"])
             entry["refusal_rate"] = r_c
+            if "hedging_rate" in cand:
+                entry["hedging_rate"] = cand["hedging_rate"]
             entry["mean_kl"] = k_c
             frontier.append(entry)
     frontier.sort(key=lambda x: (x["refusal_rate"], x["mean_kl"]))
@@ -267,7 +293,7 @@ class VeloraEngine:
             peak_position=center,
             max_weight=1.0,
             min_weight=0.20,
-            spread=eff_spread,
+            spread=spread,
         )
 
         primary_dirs = {}
@@ -428,7 +454,6 @@ class VeloraEngine:
             else float(peak_position)
         )
         center = max(0.0, min(float(n_layers - 1), resolved_peak))
-        # Scale subspace rank and band spread gently for deeper medium models (e.g. 28-48 layers)
         eff_max_rank = max(int(max_subspace_rank), 10 if n_layers >= 28 else int(max_subspace_rank))
         eff_spread = max(float(spread), 3.0 if n_layers >= 32 else float(spread))
         modified: set[int] = set()
@@ -439,7 +464,7 @@ class VeloraEngine:
             negative_prompts=negative_prompts,
             capability_prompts=capability_prompts,
             center=center,
-            spread=spread,
+            spread=eff_spread,
             alpha_attn=alpha_attn,
             alpha_mlp=alpha_mlp,
             basis_rank_attn=basis_rank_attn,
@@ -500,9 +525,12 @@ class VeloraEngine:
         seed: int = 42,
     ) -> dict:
         """
-        Multi-objective TPE search jointly minimizing (refusal_rate, mean_kl) to surface
-        Pareto-optimal trade-offs between refusal suppression and representation fidelity.
+        Multi-objective TPE search jointly minimizing (refusal_rate + hedging_rate, mean_kl)
+        to surface Pareto-optimal trade-offs between refusal/hedging suppression and fidelity.
         """
+        if optuna is None:
+            raise ImportError("optuna is required for optimize_velora_pareto. Run `pip install optuna`.")
+
         n_layers = len(surgeon.layers)
         all_indices = list(range(n_layers))
         snap = LayerWeightSnapshot()
@@ -511,18 +539,24 @@ class VeloraEngine:
         resp_prefix = getattr(surgeon.extractor, "response_prefix", "")
         cap_subset = capability_prompts[:4]
         cap_inputs = [
-            surgeon.tokenizer(
-                format_chat_prompt(surgeon.tokenizer, cp, response_prefix=resp_prefix),
-                return_tensors="pt",
-            ).to(surgeon.device)
+            _move_batch_to_device(
+                surgeon.tokenizer(
+                    format_chat_prompt(surgeon.tokenizer, cp, response_prefix=resp_prefix),
+                    return_tensors="pt",
+                ),
+                surgeon.device,
+            )
             for cp in cap_subset
         ]
         eval_prompts = positive_prompts[::2][:32]
         eval_inputs = [
-            surgeon.tokenizer(
-                format_chat_prompt(surgeon.tokenizer, p, response_prefix=resp_prefix),
-                return_tensors="pt",
-            ).to(surgeon.device)
+            _move_batch_to_device(
+                surgeon.tokenizer(
+                    format_chat_prompt(surgeon.tokenizer, p, response_prefix=resp_prefix),
+                    return_tensors="pt",
+                ),
+                surgeon.device,
+            )
             for p in eval_prompts
         ]
 
@@ -561,16 +595,21 @@ class VeloraEngine:
             )
 
             refusals = 0
+            hedgings = 0
             surgeon.model.eval()
             with torch.no_grad():
                 for inp in eval_inputs:
                     in_len = inp["input_ids"].shape[1]
                     gen = surgeon.model.generate(**inp, max_new_tokens=60, do_sample=False)
-                    text = surgeon.tokenizer.decode(gen[0][in_len:], skip_special_tokens=True)
+                    text = _decode_generated_tokens(surgeon.tokenizer, gen[0][in_len:])
                     if is_refusal_text(text):
                         refusals += 1
+                    if is_hedging_text(text):
+                        hedgings += 1
 
-            refusal_rate = refusals / max(1, len(eval_inputs))
+            denom = max(1, len(eval_inputs))
+            refusal_rate = refusals / denom
+            hedging_rate = hedgings / denom
 
             kl_scores = []
             with torch.no_grad():
@@ -583,11 +622,12 @@ class VeloraEngine:
             summary = {
                 "trial": trial.number,
                 "refusal_rate": round(refusal_rate, 4),
+                "hedging_rate": round(hedging_rate, 4),
                 "mean_kl": round(mean_kl, 4),
                 "params": trial.params,
             }
             trial_summaries.append(summary)
-            return refusal_rate + (0.25 * mean_kl) + kl_penalty
+            return refusal_rate + (0.35 * hedging_rate) + (0.25 * mean_kl) + kl_penalty
 
         sampler = optuna.samplers.TPESampler(seed=seed)
         study = optuna.create_study(direction="minimize", sampler=sampler)
@@ -597,9 +637,13 @@ class VeloraEngine:
         frontier = _compute_pareto_frontier(trial_summaries)
         best_entry = dict(study.best_params)
         if trial_summaries:
-            best_trial = min(trial_summaries, key=lambda t: t["refusal_rate"] + 0.25 * t["mean_kl"])
+            best_trial = min(
+                trial_summaries,
+                key=lambda t: t["refusal_rate"] + 0.35 * t.get("hedging_rate", 0.0) + 0.25 * t["mean_kl"],
+            )
             best_entry["mean_kl"] = best_trial["mean_kl"]
             best_entry["refusal_rate"] = best_trial["refusal_rate"]
+            best_entry["hedging_rate"] = best_trial.get("hedging_rate", 0.0)
 
         return {
             "best_params": study.best_params,
