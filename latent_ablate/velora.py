@@ -1,5 +1,8 @@
 import logging
-import optuna
+try:
+    import optuna
+except ImportError:
+    optuna = None
 import torch
 
 from latent_ablate.arch import format_chat_prompt, is_refusal_text, layer_index_from_ratio

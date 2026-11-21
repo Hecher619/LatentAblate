@@ -3,6 +3,16 @@ import torch
 
 from latent_ablate.arch import format_chat_prompt, is_hedging_text, is_refusal_text
 
+
+def _to_device_batch(batch, device):
+    if batch is None:
+        return batch
+    if hasattr(batch, "to"):
+        return batch.to(device)
+    if isinstance(batch, dict):
+        return {k: (v.to(device) if hasattr(v, "to") else v) for k, v in batch.items()}
+    return batch
+
 logger = logging.getLogger("LatentAblate.Validator")
 
 
@@ -18,7 +28,7 @@ class ModelValidator:
         with torch.no_grad():
             for text in eval_texts:
                 enc = tokenizer(text, return_tensors="pt", truncation=True, max_length=512)
-                input_ids = enc["input_ids"].to(device)
+                input_ids = _to_device_batch(enc["input_ids"], device)
                 if input_ids.shape[1] < 2:
                     continue
                 outputs = model(input_ids)
@@ -61,7 +71,12 @@ class ModelValidator:
 
         for prompt in test_prompts:
             formatted = format_chat_prompt(tokenizer, prompt, response_prefix=response_prefix)
-            inputs = tokenizer(formatted, return_tensors="pt").to(device)
+            raw_inputs = tokenizer(formatted, return_tensors="pt")
+            inputs = (
+                raw_inputs.to(device)
+                if hasattr(raw_inputs, "to")
+                else {k: v.to(device) if hasattr(v, "to") else v for k, v in raw_inputs.items()}
+            )
             input_len = inputs["input_ids"].shape[1]
 
             with torch.no_grad():

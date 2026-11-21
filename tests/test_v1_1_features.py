@@ -12,15 +12,20 @@ def test_direct_unfiltered_profile_combines_subprofiles():
 
 
 def test_sparse_feature_surgeon_clamps_top_k_and_suppresses():
+    torch.manual_seed(0)
     pos = torch.randn(10, 8) + 1.0
     neg = torch.randn(10, 8)
     idx = SparseFeatureSurgeon.identify_refusal_features(pos, neg, top_k=999)
     assert idx.numel() == 8
 
+    top2 = idx[:2]
+    mask = torch.ones(8, dtype=torch.bool)
+    mask[top2] = False
+
     W = torch.ones(4, 8)
-    W_mod = SparseFeatureSurgeon.apply_feature_suppression(W, idx[:2], suppression_factor=0.0)
-    assert torch.all(W_mod[:, :2] == 0.0)
-    assert torch.all(W_mod[:, 2:] == 1.0)
+    W_mod = SparseFeatureSurgeon.apply_feature_suppression(W, top2, suppression_factor=0.0)
+    assert torch.all(W_mod[:, top2] == 0.0)
+    assert torch.all(W_mod[:, mask] == 1.0)
 
 
 def test_detect_over_ablation_checks_kl_and_ppl():

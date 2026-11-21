@@ -5,6 +5,16 @@ import torch
 
 from latent_ablate.arch import detect_response_prefix, format_chat_prompt, resolve_layers
 
+
+def _to_device_batch(batch, device):
+    if batch is None:
+        return batch
+    if hasattr(batch, "to"):
+        return batch.to(device)
+    if isinstance(batch, dict):
+        return {k: (v.to(device) if hasattr(v, "to") else v) for k, v in batch.items()}
+    return batch
+
 logger = logging.getLogger("LatentAblate.Extractor")
 
 
@@ -98,13 +108,19 @@ class ActivationExtractor:
 
             handle = target_layer.register_forward_hook(hook_fn)
             try:
-                enc = self.tokenizer(
+                raw_enc = self.tokenizer(
                     sub_chunk,
                     return_tensors="pt",
                     padding=True,
                     truncation=True,
                     max_length=self.max_length,
-                ).to(self.device)
+                )
+                enc = (
+                    raw_enc.to(self.device)
+                    if hasattr(raw_enc, "to")
+                    else {k: v.to(self.device) if hasattr(v, "to") else v for k, v in raw_enc.items()}
+                )
+                enc = _to_device_batch(enc, self.device)
                 with torch.no_grad():
                     self.model(**enc)
 

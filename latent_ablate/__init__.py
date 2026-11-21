@@ -1,6 +1,14 @@
-from latent_ablate.surgeon import LatentAblateSurgeon
-from latent_ablate.sweeper import LayerSweeper
-from latent_ablate.diagnostics import ModelDiagnostics
+from typing import TYPE_CHECKING
 
-__version__ = "5.0.0-Hyperion"
-__all__ = ["LatentAblateSurgeon", "LayerSweeper", "ModelDiagnostics"]
+if TYPE_CHECKING:
+    from latent_ablate.surgeon import LatentAblateSurgeon
+
+__all__ = ["LatentAblateSurgeon"]
+
+
+def __getattr__(name: str):
+    if name == "LatentAblateSurgeon":
+        from latent_ablate.surgeon import LatentAblateSurgeon
+
+        return LatentAblateSurgeon
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
