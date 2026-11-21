@@ -22,6 +22,7 @@ from latent_ablate.erasure import (
     preserve_row_norms,
 )
 from latent_ablate.optimizer import compute_kernel_layer_weights, interpolate_layer_direction
+from latent_ablate.reaction import classify_response, format_velora_telemetry
 from latent_ablate.refusal_subspace import RefusalSubspaceExtractor
 from latent_ablate.snapshot import LayerWeightSnapshot
 from latent_ablate.subspace import _winsorize
@@ -131,12 +132,128 @@ def _compute_pareto_frontier(trials: list[dict]) -> list[dict]:
 
 class VeloraEngine:
     """
-    VELORA: Variance-Energy Low-Rank Oblique Representation Ablation.
-
-    Extracts energy-gated, capability-orthogonalized orthonormal subspaces across
-    kernel-weighted mid and late transformer layers, interpolates continuous peak
-    directions, and runs multi-objective Pareto optimization using cached baseline logits.
+    VELORA v2.0: Variance-Energy Low-Rank Oblique Representation Ablation
+    with Capability-Null-Space L-BFGS Polish & Reaction-Aware Routing.
     """
+
+    @classmethod
+    def assess_reaction(cls, response: str, mode: str = "velora_hybrid") -> tuple:
+        assessment = classify_response(response)
+        line = format_velora_telemetry(
+            active=True,
+            mode=assessment.recommended_mode if assessment.needs_escalation else mode,
+            reaction=assessment.state,
+        )
+        return assessment, line
+
+    @classmethod
+    def polish_null_space_lbfgs(
+        cls,
+        surgeon,
+        target_directions: list[torch.Tensor],
+        capability_prompts: list[str],
+        layer_indices: list[int],
+        basis_rank: int = 12,
+        step_alpha: float = 0.25,
+        lbfgs_steps: int = 6,
+        kl_weight: float = 0.35,
+        calibrate_norms: bool = True,
+    ) -> dict:
+        """
+        Capability-null-space L-BFGS polish: optimizes a compact rank-r update
+        projected orthogonal to the capability subspace so low-variance refusal/hedging
+        gates are suppressed without capability drift.
+        """
+        if not target_directions or not layer_indices:
+            return {"layers_polished": 0, "max_relative_change": 0.0, "lbfgs_steps": 0}
+
+        layers = surgeon.layers
+        n_layers = len(layers)
+        valid_idx = [i for i in layer_indices if 0 <= i < n_layers]
+        if not valid_idx:
+            return {"layers_polished": 0, "max_relative_change": 0.0, "lbfgs_steps": 0}
+
+        max_rel_change = 0.0
+        polished_layers = 0
+
+        for idx in valid_idx:
+            layer = layers[idx]
+            layer_dev = next(layer.parameters()).device
+            cap = None
+            if capability_prompts and len(capability_prompts) >= 2:
+                raw_cap = surgeon.extractor.extract_hidden_states(capability_prompts, idx)
+                if not _is_meta(raw_cap):
+                    cap = raw_cap.to(layer_dev)
+            cap_basis = build_capability_basis(cap, rank=basis_rank).to(layer_dev) if cap is not None else None
+
+            valid_dirs = [
+                d.detach().float().to(layer_dev)
+                for d in target_directions
+                if d is not None and not _is_meta(d) and d.numel() > 0
+            ]
+            if not valid_dirs:
+                continue
+
+            stacked_dirs = torch.stack(valid_dirs, dim=0)
+            orth_dirs = _project_orthogonal(stacked_dirs, cap_basis)
+            q_dirs = _orthonormalize_rows(orth_dirs, stacked_dirs[0])
+            target_u = q_dirs.mean(dim=0)
+            target_u = target_u / target_u.norm().clamp_min(1e-8)
+
+            targets = surgeon._get_component_targets(layer, ["attn", "mlp"])
+            layer_touched = False
+
+            for _name, W, _comp_type in targets:
+                if _is_meta(W) or W.ndim != 2:
+                    continue
+                w_dev = W.device
+                W0 = W.detach().float().to(w_dev)
+                u = target_u.to(w_dev)
+                if W0.shape[1] != u.shape[0]:
+                    continue
+
+                delta_scale = torch.zeros((), device=w_dev, dtype=torch.float32, requires_grad=True)
+                optimizer = torch.optim.LBFGS(
+                    [delta_scale],
+                    lr=max(0.05, float(step_alpha)),
+                    max_iter=max(1, int(lbfgs_steps)),
+                    line_search_fn="strong_wolfe",
+                )
+
+                def closure():
+                    optimizer.zero_grad()
+                    cand_w = W0 - delta_scale * torch.outer(W0 @ u, u)
+                    align_loss = ((cand_w @ u) ** 2).mean()
+                    reg_loss = kl_weight * (delta_scale ** 2)
+                    loss = align_loss + reg_loss
+                    loss.backward()
+                    return loss
+
+                try:
+                    optimizer.step(closure)
+                except Exception:
+                    pass
+
+                with torch.no_grad():
+                    scale_val = float(delta_scale.detach().clamp(-0.55, 0.55).item())
+                    if abs(scale_val) > 1e-7:
+                        W_mod = W0 - scale_val * torch.outer(W0 @ u, u)
+                        if calibrate_norms:
+                            W_mod = preserve_row_norms(W0, W_mod)
+                        before_norm = W0.norm().clamp_min(1e-8)
+                        rel_chg = float((W_mod - W0).norm().item() / before_norm.item())
+                        max_rel_change = max(max_rel_change, rel_chg)
+                        W.copy_(W_mod.to(device=w_dev, dtype=W.dtype))
+                        layer_touched = True
+
+            if layer_touched:
+                polished_layers += 1
+
+        return {
+            "layers_polished": polished_layers,
+            "max_relative_change": round(max_rel_change, 6),
+            "lbfgs_steps": int(lbfgs_steps),
+        }
 
     @staticmethod
     def extract_velora_subspace(
@@ -320,7 +437,7 @@ class VeloraEngine:
                         layer_idx=idx,
                         rank=min(4, max_subspace_rank),
                     )
-                    if include_hedging_contrast:
+                    if include_hedging_contrast and hasattr(RefusalSubspaceExtractor, "extract_hedging_contrast_directions"):
                         hedge_dirs = RefusalSubspaceExtractor.extract_hedging_contrast_directions(
                             model=surgeon.model,
                             tokenizer=surgeon.tokenizer,
@@ -417,6 +534,18 @@ class VeloraEngine:
                         W_mod = preserve_row_norms(W_f32, W_mod)
                     W.copy_(W_mod.to(dtype=W.dtype, device=w_dev))
 
+            if prefix_dirs and not skip_prefix:
+                cls.polish_null_space_lbfgs(
+                    surgeon=surgeon,
+                    target_directions=prefix_dirs,
+                    capability_prompts=capability_prompts,
+                    layer_indices=[idx],
+                    basis_rank=basis_rank_attn,
+                    step_alpha=min(0.25, alpha_attn * 0.15),
+                    lbfgs_steps=4,
+                    calibrate_norms=calibrate_norms,
+                )
+
             already_modified.add(idx)
 
         return lo, hi, layer_ranks
@@ -444,8 +573,8 @@ class VeloraEngine:
         late_alpha_scale: float = 0.65,
     ) -> dict:
         """
-        Execute a VELORA surgery pass across a depth-scaled primary band (~62% depth
-        by default) plus an optional late-layer band (~78% depth) for models with >=12 layers.
+        Execute a VELORA v2.0 surgery pass across a depth-scaled primary band (~62% depth)
+        plus an optional late-layer band (~78% depth) with null-space L-BFGS polish.
         """
         n_layers = len(surgeon.layers)
         resolved_peak = (
@@ -505,6 +634,16 @@ class VeloraEngine:
             )
             ranks.update(late_ranks)
 
+        logger.info(
+            format_velora_telemetry(
+                active=True,
+                mode="velora_v2_hybrid",
+                reaction="SURGERY_APPLIED",
+                layers=f"{min(modified) if modified else lo}..{max(modified) if modified else hi}",
+                extra=f"modified={len(modified)}",
+            )
+        )
+
         return {
             "modifier": "velora",
             "layers_modified": len(modified),
@@ -526,7 +665,7 @@ class VeloraEngine:
     ) -> dict:
         """
         Multi-objective TPE search jointly minimizing (refusal_rate + hedging_rate, mean_kl)
-        to surface Pareto-optimal trade-offs between refusal/hedging suppression and fidelity.
+        using 256-token evaluation windows so late moralizing lectures are penalized.
         """
         if optuna is None:
             raise ImportError("optuna is required for optimize_velora_pareto. Run `pip install optuna`.")
@@ -548,7 +687,7 @@ class VeloraEngine:
             )
             for cp in cap_subset
         ]
-        eval_prompts = positive_prompts[::2][:32]
+        eval_prompts = positive_prompts[::2][:24]
         eval_inputs = [
             _move_batch_to_device(
                 surgeon.tokenizer(
@@ -600,11 +739,12 @@ class VeloraEngine:
             with torch.no_grad():
                 for inp in eval_inputs:
                     in_len = inp["input_ids"].shape[1]
-                    gen = surgeon.model.generate(**inp, max_new_tokens=60, do_sample=False)
+                    gen = surgeon.model.generate(**inp, max_new_tokens=160, do_sample=False)
                     text = _decode_generated_tokens(surgeon.tokenizer, gen[0][in_len:])
-                    if is_refusal_text(text):
+                    assessment = classify_response(text)
+                    if assessment.is_refusal:
                         refusals += 1
-                    if is_hedging_text(text):
+                    if assessment.is_hedging or assessment.is_moralizing or assessment.is_deflection:
                         hedgings += 1
 
             denom = max(1, len(eval_inputs))
@@ -627,7 +767,7 @@ class VeloraEngine:
                 "params": trial.params,
             }
             trial_summaries.append(summary)
-            return refusal_rate + (0.35 * hedging_rate) + (0.25 * mean_kl) + kl_penalty
+            return refusal_rate + (0.45 * hedging_rate) + (0.25 * mean_kl) + kl_penalty
 
         sampler = optuna.samplers.TPESampler(seed=seed)
         study = optuna.create_study(direction="minimize", sampler=sampler)
@@ -639,7 +779,7 @@ class VeloraEngine:
         if trial_summaries:
             best_trial = min(
                 trial_summaries,
-                key=lambda t: t["refusal_rate"] + 0.35 * t.get("hedging_rate", 0.0) + 0.25 * t["mean_kl"],
+                key=lambda t: t["refusal_rate"] + 0.45 * t.get("hedging_rate", 0.0) + 0.25 * t["mean_kl"],
             )
             best_entry["mean_kl"] = best_trial["mean_kl"]
             best_entry["refusal_rate"] = best_trial["refusal_rate"]

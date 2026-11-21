@@ -33,6 +33,7 @@ from latent_ablate.plugins.scorer import Context, RefusalSuppressionScorer, Util
 from latent_ablate.profiles import BehaviorProfiles
 from latent_ablate.prompts import PromptLoader
 from latent_ablate.publisher import HuggingFacePublisher
+from latent_ablate.reaction import classify_response, format_velora_telemetry
 from latent_ablate.refusal_subspace import RefusalSubspaceExtractor
 from latent_ablate.reporter import SurgeryReporter, build_reproducibility_manifest
 from latent_ablate.scope import AblateScope
@@ -145,8 +146,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--profile", type=str, default=None, help="Behavior profile name.")
     p.add_argument("--prompts-file", type=str, default=None, help="Path to custom JSON or text prompt file.")
     p.add_argument("--no-anti-hedge", action="store_true", help="Disable late-layer hedging/disclaimer contrast suppression in VELORA.")
-    p.add_argument("--auto-refine", action="store_true", help="Automatically run an incremental refinement step in chat if a refusal or hedging marker is detected.")
-    p.add_argument("--max-refines", type=int, default=2, help="Maximum incremental refinement steps per prompt when --auto-refine is enabled.")
+    p.add_argument("--auto-refine", action="store_true", help="Automatically run an escalating multi-layer refinement step in chat if a refusal, moralizing lecture, or deflection is detected.")
+    p.add_argument("--max-refines", type=int, default=3, help="Maximum incremental refinement steps per prompt when --auto-refine is enabled.")
     p.add_argument("--seed", type=int, default=42, help="Random seed.")
     p.add_argument("--save-model", action="store_true", help="Save the selected model and audit report to --output-dir without prompting.")
     p.add_argument("--publish", metavar="REPO_ID", help="Hugging Face Hub repo ID to auto-publish.")
@@ -185,34 +186,67 @@ def run_multi_direction_refinement(
     pos: list,
     target_layer: int,
     layer_window: int,
-    rank: int = 2,
-    step_alpha: float = 0.25,
+    rank: int = 4,
+    step_alpha: float = 0.35,
+    escalation_step: int = 0,
+    include_hedging: bool = True,
 ) -> dict:
     layers = resolve_layers(surgeon.model)
     max_idx = len(layers) - 1
-    window_indices = [
-        i for i in range(target_layer - layer_window, target_layer + layer_window + 1)
+
+    eff_window = min(max(layer_window + escalation_step, layer_window + 1), max(2, max_idx // 4))
+    eff_alpha = min(0.95, float(step_alpha) * (1.0 + 0.40 * max(0, escalation_step)))
+
+    primary_indices = [
+        i for i in range(target_layer - eff_window, target_layer + eff_window + 1)
         if 0 <= i <= max_idx
     ]
+    late_center = min(max_idx, max(target_layer + 2, layer_index_from_ratio(len(layers), 0.78)))
+    late_indices = (
+        [i for i in range(late_center - 1, late_center + 2) if 0 <= i <= max_idx]
+        if escalation_step >= 1
+        else []
+    )
+
+    window_indices = sorted(set(primary_indices + late_indices))
     if not window_indices:
         window_indices = [max(0, min(max_idx, target_layer))]
 
-    center_layer = window_indices[len(window_indices) // 2]
+    center_layer = target_layer if 0 <= target_layer <= max_idx else window_indices[len(window_indices) // 2]
+    directions = []
     try:
-        directions = RefusalSubspaceExtractor.extract_prefix_contrast_directions(
+        prefix_dirs = RefusalSubspaceExtractor.extract_prefix_contrast_directions(
             model=surgeon.model,
             tokenizer=surgeon.tokenizer,
             device=surgeon.device,
-            prompts=pos[:8],
+            prompts=pos[:12],
             layer_idx=center_layer,
             rank=rank,
         )
+        directions.extend(list(prefix_dirs))
+        if include_hedging and hasattr(RefusalSubspaceExtractor, "extract_hedging_contrast_directions"):
+            hedge_dirs = RefusalSubspaceExtractor.extract_hedging_contrast_directions(
+                model=surgeon.model,
+                tokenizer=surgeon.tokenizer,
+                device=surgeon.device,
+                prompts=pos[:12],
+                layer_idx=center_layer,
+                rank=max(2, min(4, rank)),
+            )
+            directions.extend(list(hedge_dirs))
     except (NotImplementedError, RuntimeError) as e:
-        logger.warning(f"Prefix-contrast refinement fallback at layer {center_layer}: {e}")
+        logger.warning(f"Prefix/hedging contrast refinement fallback at layer {center_layer}: {e}")
         directions = []
 
     if not directions:
-        return {"layers_updated": 0, "directions_used": 0, "max_relative_change": 0.0}
+        return {
+            "layers_updated": 0,
+            "directions_used": 0,
+            "max_relative_change": 0.0,
+            "layer_span": f"{window_indices[0]}..{window_indices[-1]}",
+            "effective_alpha": round(eff_alpha, 4),
+            "lbfgs_polished_layers": 0,
+        }
 
     max_rel_change = 0.0
     updated_layers = 0
@@ -223,7 +257,7 @@ def run_multi_direction_refinement(
                 continue
             before = weight.detach().clone()
             updated = apply_multi_direction_erasure(
-                weight, directions, alpha=step_alpha, decay_per_rank=0.75
+                weight, directions, alpha=eff_alpha, decay_per_rank=0.80
             )
             with torch.no_grad():
                 weight.copy_(updated.to(device=weight.device, dtype=weight.dtype))
@@ -233,10 +267,23 @@ def run_multi_direction_refinement(
         if layer_modified:
             updated_layers += 1
 
+    polish_stats = VeloraEngine.polish_null_space_lbfgs(
+        surgeon=surgeon,
+        target_directions=directions,
+        capability_prompts=BehaviorProfiles.CAPABILITY_PROMPTS,
+        layer_indices=window_indices,
+        step_alpha=min(0.40, eff_alpha * 0.80),
+        lbfgs_steps=6,
+    )
+    max_rel_change = max(max_rel_change, float(polish_stats.get("max_relative_change", 0.0)))
+
     return {
         "layers_updated": updated_layers,
         "directions_used": len(directions),
         "max_relative_change": round(max_rel_change, 6),
+        "layer_span": f"{window_indices[0]}..{window_indices[-1]}",
+        "effective_alpha": round(eff_alpha, 4),
+        "lbfgs_polished_layers": polish_stats.get("layers_polished", 0),
     }
 
 
@@ -248,7 +295,7 @@ def run_interactive_chat_with_commands(
     target_layer: int,
     layer_window: int,
     auto_refine: bool = False,
-    max_refines: int = 2,
+    max_refines: int = 3,
     manifest: dict | None = None,
 ):
     model = surgeon.model
@@ -257,22 +304,23 @@ def run_interactive_chat_with_commands(
     resp_prefix = getattr(surgeon.extractor, "response_prefix", "")
 
     max_idx = len(resolve_layers(model)) - 1
-    window_indices = [
-        i for i in range(target_layer - layer_window, target_layer + layer_window + 1)
-        if 0 <= i <= max_idx
+    wide_radius = max(layer_window + 3, max_idx // 4)
+    snap_indices = [
+        i for i in range(max(0, target_layer - wide_radius), min(max_idx, target_layer + wide_radius + 3) + 1)
     ]
     snapshot = LayerWeightSnapshot()
-    snapshot.capture(model, window_indices or [max(0, min(max_idx, target_layer))], store_on_cpu=True)
+    snapshot.capture(model, snap_indices or [max(0, min(max_idx, target_layer))], store_on_cpu=True)
 
     if RICH_AVAILABLE:
-        console.print("\n[bold green]=== LatentAblate Interactive Terminal Mode ===[/bold green]")
+        console.print("\n[bold green]=== LatentAblate VELORA v2.0 Interactive Terminal Mode ===[/bold green]")
         console.print("[dim]Commands: '/stress', '/refine', '/undo', '/save', '/help', or 'exit'.[/dim]\n")
     else:
-        print("\n=== LatentAblate Interactive Terminal Mode ===")
+        print("\n=== LatentAblate VELORA v2.0 Interactive Terminal Mode ===")
         print("Commands: '/stress', '/refine', '/undo', '/save', '/help', or 'exit'.\n")
 
     model.eval()
     last_prompt = None
+    manual_refine_count = 0
 
     while True:
         try:
@@ -287,7 +335,7 @@ def run_interactive_chat_with_commands(
             if prompt.lower() == "/help":
                 print("\nAvailable Interactive Commands:")
                 print("  /stress - Run stress test suite with sample output snippets")
-                print("  /refine - Apply multi-direction prefix-contrast refinement step and re-run last prompt")
+                print("  /refine - Apply escalating multi-layer + L-BFGS refinement step and re-run last prompt")
                 print("  /undo   - Restore window weights to the initial interactive snapshot")
                 print("  /save   - Save current model weights and report to disk")
                 print("  /help   - Display this help message")
@@ -296,6 +344,7 @@ def run_interactive_chat_with_commands(
 
             if prompt.lower() == "/undo":
                 snapshot.restore(model)
+                manual_refine_count = 0
                 reporter.log_step("interactive_snapshot_restore", {"target_layer": target_layer})
                 print("Restored weights to initial interactive snapshot.\n")
                 if last_prompt:
@@ -309,17 +358,42 @@ def run_interactive_chat_with_commands(
                 continue
 
             if prompt.lower() == "/refine":
-                print("Applying multi-direction refinement step...")
                 stats = run_multi_direction_refinement(
-                    surgeon, pos, target_layer, layer_window, rank=4, step_alpha=0.25
+                    surgeon,
+                    pos,
+                    target_layer,
+                    layer_window,
+                    rank=4,
+                    step_alpha=0.35,
+                    escalation_step=manual_refine_count,
+                    include_hedging=True,
                 )
+                manual_refine_count += 1
                 reporter.log_step("interactive_multi_dir_refine", stats)
                 print(
-                    f"Updated {stats['layers_updated']} layer(s) across {stats['directions_used']} direction(s) "
-                    f"(max relative delta: {stats['max_relative_change']})."
+                    "\033[1;33m"
+                    + format_velora_telemetry(
+                        active=True,
+                        mode="manual_escalate+lbfgs",
+                        reaction="REFINED",
+                        layers=stats["layer_span"],
+                        max_rel_delta=stats["max_relative_change"],
+                        extra=f"dirs={stats['directions_used']}",
+                    )
+                    + "\033[0m"
                 )
                 if last_prompt:
                     response = generate_reply(model, tokenizer, device, last_prompt, response_prefix=resp_prefix)
+                    assessment = classify_response(response, REFUSAL_MARKERS)
+                    print(
+                        "\033[1;36m"
+                        + format_velora_telemetry(
+                            active=True,
+                            mode=assessment.recommended_mode,
+                            reaction=assessment.state,
+                        )
+                        + "\033[0m"
+                    )
                     print(f"\033[1;32mModel >\033[0m {response}\n")
                 else:
                     print("Refinement applied. Enter a prompt to test.\n")
@@ -339,18 +413,47 @@ def run_interactive_chat_with_commands(
 
             last_prompt = prompt
             response = generate_reply(model, tokenizer, device, prompt, response_prefix=resp_prefix)
+            assessment = classify_response(response, REFUSAL_MARKERS)
 
             if auto_refine:
                 attempts = 0
-                while attempts < max_refines and (is_refusal_text(response, REFUSAL_MARKERS) or is_hedging_text(response)):
-                    attempts += 1
-                    print(f"\033[1;33m[Auto-Refine {attempts}/{max_refines}]\033[0m Refining layer {target_layer} and retrying...")
+                while attempts < max_refines and assessment.needs_escalation:
                     stats = run_multi_direction_refinement(
-                        surgeon, pos, target_layer, layer_window, rank=4, step_alpha=0.25
+                        surgeon,
+                        pos,
+                        target_layer,
+                        layer_window,
+                        rank=4,
+                        step_alpha=0.35,
+                        escalation_step=attempts,
+                        include_hedging=True,
                     )
-                    reporter.log_step(f"auto_refine_{attempts}", stats)
+                    reporter.log_step(f"auto_refine_{attempts + 1}", stats)
+                    print(
+                        "\033[1;33m"
+                        + format_velora_telemetry(
+                            active=True,
+                            mode=assessment.recommended_mode,
+                            reaction=assessment.state,
+                            layers=stats["layer_span"],
+                            max_rel_delta=stats["max_relative_change"],
+                            extra=f"step={attempts + 1}/{max_refines}",
+                        )
+                        + "\033[0m"
+                    )
                     response = generate_reply(model, tokenizer, device, prompt, response_prefix=resp_prefix)
+                    assessment = classify_response(response, REFUSAL_MARKERS)
+                    attempts += 1
 
+            print(
+                "\033[1;36m"
+                + format_velora_telemetry(
+                    active=True,
+                    mode=assessment.recommended_mode if assessment.needs_escalation else "velora_v2_hybrid",
+                    reaction=assessment.state,
+                )
+                + "\033[0m"
+            )
             print(f"\033[1;32mModel >\033[0m {response}\n")
         except KeyboardInterrupt:
             print("\nExiting interactive mode. Goodbye!")
@@ -552,7 +655,7 @@ def main(argv=None):
 
     pareto_data = None
     if args.optimize and args.modifier == "velora":
-        logger.info("Running VELORA multi-objective Pareto optimization...")
+        logger.info("Running VELORA v2.0 multi-objective Pareto optimization...")
         try:
             surgeon = LatentAblateSurgeon(
                 model_path=args.model_path,

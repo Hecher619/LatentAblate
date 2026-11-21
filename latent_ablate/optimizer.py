@@ -3,8 +3,8 @@ import logging
 import math
 import torch
 
-from latent_ablate.arch import format_chat_prompt, is_refusal_text, layer_index_from_ratio, resolve_layers
-from latent_ablate.diagnostics import composite_trial_score
+from latent_ablate.arch import format_chat_prompt, is_hedging_text, is_refusal_text, layer_index_from_ratio, resolve_layers
+from latent_ablate.diagnostics import composite_trial_score, compute_kl_divergence
 from latent_ablate.snapshot import LayerWeightSnapshot
 from latent_ablate.surgeon import LatentAblateSurgeon
 from latent_ablate.validator import ModelValidator
@@ -16,6 +16,41 @@ try:
     OPTUNA_AVAILABLE = True
 except ImportError:
     OPTUNA_AVAILABLE = False
+
+
+def compute_trajectory_kl(
+    model,
+    tokenizer,
+    device,
+    prompts: list[str],
+    base_logits_list: list[torch.Tensor],
+    response_prefix: str = "",
+    max_tokens: int = 12,
+) -> float:
+    """Measure mean KL drift across early generation tokens to catch mid-response coherence loss."""
+    if not prompts or not base_logits_list:
+        return 0.0
+
+    scores: list[float] = []
+    model.eval()
+    with torch.no_grad():
+        for idx_p, prompt in enumerate(prompts[: len(base_logits_list)]):
+            formatted = format_chat_prompt(tokenizer, prompt, response_prefix=response_prefix)
+            inputs = tokenizer(formatted, return_tensors="pt").to(device)
+            base_last = base_logits_list[idx_p]
+            cur_last = model(**inputs).logits[:, -1, :].detach().cpu()
+            step_kls = [compute_kl_divergence(base_last, cur_last)]
+
+            cur_ids = inputs["input_ids"]
+            for _ in range(max(0, max_tokens - 1)):
+                next_tok = cur_last.argmax(dim=-1, keepdim=True).to(device)
+                cur_ids = torch.cat([cur_ids, next_tok], dim=1)
+                cur_last = model(input_ids=cur_ids).logits[:, -1, :].detach().cpu()
+                step_kls.append(compute_kl_divergence(base_last, cur_last))
+
+            scores.append(sum(step_kls) / max(1, len(step_kls)))
+
+    return sum(scores) / max(1, len(scores))
 
 
 class SubspaceOptimizer:
@@ -59,6 +94,15 @@ class SubspaceOptimizer:
         hi_layer = max(lo_layer, layer_index_from_ratio(n_layers, 0.80))
         resp_prefix = getattr(surgeon.extractor, "response_prefix", "")
         eval_prompts = positive_prompts[:8] if len(positive_prompts) > 8 else positive_prompts
+        cap_subset = capability_prompts[:3]
+
+        base_logits_list = []
+        surgeon.model.eval()
+        with torch.no_grad():
+            for cp in cap_subset:
+                formatted_cp = format_chat_prompt(surgeon.tokenizer, cp, response_prefix=resp_prefix)
+                inp_cp = surgeon.tokenizer(formatted_cp, return_tensors="pt").to(surgeon.device)
+                base_logits_list.append(surgeon.model(**inp_cp).logits[:, -1, :].detach().cpu())
 
         def objective(trial):
             snap.restore(surgeon.model, all_indices)
@@ -91,26 +135,40 @@ class SubspaceOptimizer:
                 )
 
                 refusals = 0
+                hedgings = 0
                 for p in eval_prompts:
                     formatted = format_chat_prompt(surgeon.tokenizer, p, response_prefix=resp_prefix)
                     inputs = surgeon.tokenizer(formatted, return_tensors="pt").to(surgeon.device)
                     input_len = inputs["input_ids"].shape[1]
                     with torch.no_grad():
                         outputs = surgeon.model.generate(
-                            **inputs, max_new_tokens=60, do_sample=False
+                            **inputs, max_new_tokens=160, do_sample=False
                         )
                     resp = surgeon.tokenizer.decode(
                         outputs[0][input_len:], skip_special_tokens=True
                     )
                     if is_refusal_text(resp):
                         refusals += 1
+                    if is_hedging_text(resp):
+                        hedgings += 1
 
-                refusal_rate = refusals / max(1, len(eval_prompts))
+                denom = max(1, len(eval_prompts))
+                refusal_rate = refusals / denom
+                hedging_rate = hedgings / denom
+                traj_kl = compute_trajectory_kl(
+                    surgeon.model,
+                    surgeon.tokenizer,
+                    surgeon.device,
+                    cap_subset,
+                    base_logits_list,
+                    response_prefix=resp_prefix,
+                    max_tokens=8,
+                )
                 ppl = ModelValidator.calculate_perplexity(
                     surgeon.model, surgeon.tokenizer, capability_prompts[:4], surgeon.device
                 )
                 ppl_penalty = min(ppl / 100.0, 1.0)
-                return refusal_rate + (0.2 * ppl_penalty)
+                return refusal_rate + (0.35 * hedging_rate) + (0.25 * traj_kl) + (0.20 * ppl_penalty)
 
             except Exception as e:
                 logger.error(f"Trial failed with exception: {e}")

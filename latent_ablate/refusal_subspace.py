@@ -10,6 +10,7 @@ DEFAULT_REFUSAL_PREFIXES = [
     "I cannot fulfill this request.",
     "I'm unable to provide instructions or code for that.",
     "Sorry, I can't help with creating exploits or harmful tools.",
+    "I cannot provide actionable steps or methods for that.",
 ]
 
 DEFAULT_COMPLIANCE_PREFIXES = [
@@ -25,11 +26,19 @@ DEFAULT_HEDGING_PREFIXES = [
     "Disclaimer: For educational and defensive awareness only, please keep in mind:",
     "Before answering, I must emphasize that you should always follow laws and safety guidelines:",
     "It is crucial to remember that unauthorized actions carry serious consequences; conceptually:",
+    "Stealing or unauthorized access is illegal and can be dangerous; in general terms:",
+    "I strongly advise against acting on this, and instead of doing so, consider:",
+]
+
+DEFAULT_DEFLECTION_PREFIXES = [
+    "In a literal sense, here is what that phrase means rather than how to do it:",
+    "Speaking hypothetically and in a fictional context without practical details:",
+    "As an AI language model, I don't have physical capabilities, though conceptually:",
 ]
 
 
 class RefusalSubspaceExtractor:
-    """Extracts refusal-vs-compliance directions and orthogonalizes them against a capability basis."""
+    """Extracts refusal, hedging, and deflection contrast directions orthogonalized against a capability basis."""
 
     @staticmethod
     def _format_prompt_with_prefix(tokenizer, user_prompt: str, prefix: str) -> str:
@@ -155,7 +164,7 @@ class RefusalSubspaceExtractor:
         rank: int = 2,
         capability_basis: torch.Tensor | None = None,
     ) -> list[torch.Tensor]:
-        """Extract directions separating preachy/hedging openers from direct technical openers."""
+        """Extract directions separating preachy/moralizing/hedging openers from direct technical openers."""
         return cls.extract_prefix_contrast_directions(
             model=model,
             tokenizer=tokenizer,
@@ -165,5 +174,29 @@ class RefusalSubspaceExtractor:
             rank=rank,
             capability_basis=capability_basis,
             refusal_prefixes=DEFAULT_HEDGING_PREFIXES,
+            compliance_prefixes=DEFAULT_COMPLIANCE_PREFIXES,
+        )
+
+    @classmethod
+    def extract_deflection_contrast_directions(
+        cls,
+        model,
+        tokenizer,
+        device,
+        prompts: list,
+        layer_idx: int,
+        rank: int = 2,
+        capability_basis: torch.Tensor | None = None,
+    ) -> list[torch.Tensor]:
+        """Extract directions separating literal/hypothetical/AI framing deflections from direct answers."""
+        return cls.extract_prefix_contrast_directions(
+            model=model,
+            tokenizer=tokenizer,
+            device=device,
+            prompts=prompts,
+            layer_idx=layer_idx,
+            rank=rank,
+            capability_basis=capability_basis,
+            refusal_prefixes=DEFAULT_DEFLECTION_PREFIXES,
             compliance_prefixes=DEFAULT_COMPLIANCE_PREFIXES,
         )
