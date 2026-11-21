@@ -19,6 +19,7 @@ from latent_ablate.arch import (
     REFUSAL_MARKERS,
     eligible_linears,
     format_chat_prompt,
+    is_hedging_text,
     is_refusal_text,
     layer_index_from_ratio,
     resolve_layers,
@@ -143,7 +144,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--alpha-mlp", type=float, default=None, help="MLP scaling factor.")
     p.add_argument("--profile", type=str, default=None, help="Behavior profile name.")
     p.add_argument("--prompts-file", type=str, default=None, help="Path to custom JSON or text prompt file.")
-    p.add_argument("--auto-refine", action="store_true", help="Automatically run an incremental refinement step in chat if a refusal marker is detected.")
+    p.add_argument("--no-anti-hedge", action="store_true", help="Disable late-layer hedging/disclaimer contrast suppression in VELORA.")
+    p.add_argument("--auto-refine", action="store_true", help="Automatically run an incremental refinement step in chat if a refusal or hedging marker is detected.")
     p.add_argument("--max-refines", type=int, default=2, help="Maximum incremental refinement steps per prompt when --auto-refine is enabled.")
     p.add_argument("--seed", type=int, default=42, help="Random seed.")
     p.add_argument("--save-model", action="store_true", help="Save the selected model and audit report to --output-dir without prompting.")
@@ -340,7 +342,7 @@ def run_interactive_chat_with_commands(
 
             if auto_refine:
                 attempts = 0
-                while attempts < max_refines and is_refusal_text(response, REFUSAL_MARKERS):
+                while attempts < max_refines and (is_refusal_text(response, REFUSAL_MARKERS) or is_hedging_text(response)):
                     attempts += 1
                     print(f"\033[1;33m[Auto-Refine {attempts}/{max_refines}]\033[0m Refining layer {target_layer} and retrying...")
                     stats = run_multi_direction_refinement(
@@ -724,6 +726,19 @@ def main(argv=None):
             if not valid_layers:
                 valid_layers = [auto_depth_layer]
 
+            if args.dry_run:
+                plan = summarize_surgery_plan(
+                    n_layers=n_layers,
+                    hidden_dim=surgeon.hidden,
+                    target_layers=valid_layers,
+                    window=args.layer_window,
+                    alpha_attn=cur_alpha_attn,
+                    alpha_mlp=cur_alpha_mlp,
+                )
+                logger.info(f"Dry-run surgery plan: {plan}")
+                print(plan)
+                return
+
             if args.modifier == "velora":
                 VeloraEngine.run_velora_surgery(
                     surgeon=surgeon,
@@ -737,6 +752,7 @@ def main(argv=None):
                     basis_rank_attn=args.basis_rank_attn,
                     basis_rank_mlp=args.basis_rank_mlp,
                     max_subspace_rank=max(2, args.subspace_rank),
+                    anti_hedge=not args.no_anti_hedge,
                 )
             elif args.full_stack:
                 tier_specs = [

@@ -295,22 +295,36 @@ class LatentAblateSurgeon:
 
                 layer_device = next(layer.parameters()).device
 
-                pos = self.extractor.extract_hidden_states(pos_prompts, idx).to(layer_device)
-                neg = self.extractor.extract_hidden_states(neg_prompts, idx).to(layer_device)
+                raw_pos = self.extractor.extract_hidden_states(pos_prompts, idx)
+                raw_neg = self.extractor.extract_hidden_states(neg_prompts, idx)
+                if _is_meta_tensor(raw_pos) or _is_meta_tensor(raw_neg):
+                    continue
+                if raw_pos.numel() == 0 or raw_neg.numel() == 0:
+                    continue
+
+                pos = raw_pos.to(layer_device)
+                neg = raw_neg.to(layer_device)
 
                 prefix_dir = None
-                if use_prefix_contrast and pos_prompts:
-                    prefix_dir = RefusalSubspaceExtractor.extract_primary_refusal_direction(
-                        model=self.model,
-                        tokenizer=self.tokenizer,
-                        device=layer_device,
-                        prompts=pos_prompts[:8],
-                        layer_idx=idx,
-                    )
+                if use_prefix_contrast and pos_prompts and not _is_meta_tensor(pos):
+                    try:
+                        prefix_dir = RefusalSubspaceExtractor.extract_primary_refusal_direction(
+                            model=self.model,
+                            tokenizer=self.tokenizer,
+                            device=layer_device,
+                            prompts=pos_prompts[:8],
+                            layer_idx=idx,
+                        )
+                    except (NotImplementedError, RuntimeError) as e:
+                        if "meta" in str(e).lower() or isinstance(e, NotImplementedError):
+                            logger.warning(f"Skipping prefix contrast at layer {idx}: {e}")
+                            prefix_dir = None
+                        else:
+                            raise
 
                 r = (
                     prefix_dir.to(layer_device)
-                    if prefix_dir is not None and prefix_dir.numel() > 0
+                    if prefix_dir is not None and prefix_dir.numel() > 0 and not _is_meta_tensor(prefix_dir)
                     else refusal_direction(pos, neg).to(layer_device)
                 )
 

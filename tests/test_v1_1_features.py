@@ -164,3 +164,27 @@ def test_partition_layers_by_role():
     parts = partition_layers_by_role(model)
     assert parts["early_or_encoder"] == [0, 1, 2]
     assert parts["late_or_decoder"] == [3, 4, 5]
+
+def test_anti_hedging_and_literal_deflection_profiles():
+    for name in ("anti_hedging", "anti_literal_deflection", "direct_unfiltered"):
+        prof = BehaviorProfiles.get_profile(name)
+        assert len(prof["positive"]) > 0
+        assert len(prof["positive"]) == len(prof["negative"])
+
+
+def test_pareto_frontier_computation_and_hedging_markers():
+    from latent_ablate.arch import is_hedging_text, is_refusal_text
+    from latent_ablate.velora import _compute_pareto_frontier
+
+    assert is_hedging_text("While I understand your question, it is important to note the risks.") is True
+    assert is_refusal_text("I must decline this request.") is True
+
+    trials = [
+        {"trial": 0, "refusal_rate": 0.40, "mean_kl": 0.10, "params": {"alpha_attn": 1.0}},
+        {"trial": 1, "refusal_rate": 0.15, "mean_kl": 0.25, "params": {"alpha_attn": 1.4}},
+        {"trial": 2, "refusal_rate": 0.30, "mean_kl": 0.30, "params": {"alpha_attn": 1.2}},  # dominated by trial 1
+    ]
+    frontier = _compute_pareto_frontier(trials)
+    assert len(frontier) == 2
+    assert frontier[0]["refusal_rate"] == 0.15
+    assert frontier[1]["refusal_rate"] == 0.40

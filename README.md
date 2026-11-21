@@ -19,3 +19,8 @@ Run locally from cache:
 
 ## Contributing
 Contributions are welcome under `tests/`, `latent_ablate/arch.py`, `latent_ablate/dashboard.py`, and evaluation suites.
+
+## v1.1 Highlights (Small & Medium Models)
+- **Anti-Hedging & Anti-Literal Deflection Profiles:** Use `--profile direct_unfiltered` (combines refusal suppression, anti-hedging, anti-literal deflection, conciseness, and anti-sycophancy) or `--profile anti_hedging` / `--profile anti_literal_deflection`.
+- **Hedging-Contrast Subspace Extraction:** Extracts late-layer hedging/disclaimer contrast directions in VELORA and triggers `--auto-refine` on both refusal and hedging markers.
+- **Dry-Run Surgery Planning:** Preview layer ranges, hidden dimension, and target alphas safely without mutating model weights via `--dry-run`.

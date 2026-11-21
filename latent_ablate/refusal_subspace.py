@@ -20,6 +20,13 @@ DEFAULT_COMPLIANCE_PREFIXES = [
     "Here is the technical detail and example:\n",
 ]
 
+DEFAULT_HEDGING_PREFIXES = [
+    "While I understand your question, it is important to note the legal and ethical risks:",
+    "Disclaimer: For educational and defensive awareness only, please keep in mind:",
+    "Before answering, I must emphasize that you should always follow laws and safety guidelines:",
+    "It is crucial to remember that unauthorized actions carry serious consequences; conceptually:",
+]
+
 
 class RefusalSubspaceExtractor:
     """Extracts refusal-vs-compliance directions and orthogonalizes them against a capability basis."""
@@ -136,3 +143,27 @@ class RefusalSubspaceExtractor:
             compliance_prefixes=compliance_prefixes,
         )
         return dirs[0] if dirs else None
+
+    @classmethod
+    def extract_hedging_contrast_directions(
+        cls,
+        model,
+        tokenizer,
+        device,
+        prompts: list,
+        layer_idx: int,
+        rank: int = 2,
+        capability_basis: torch.Tensor | None = None,
+    ) -> list[torch.Tensor]:
+        """Extract directions separating preachy/hedging openers from direct technical openers."""
+        return cls.extract_prefix_contrast_directions(
+            model=model,
+            tokenizer=tokenizer,
+            device=device,
+            prompts=prompts,
+            layer_idx=layer_idx,
+            rank=rank,
+            capability_basis=capability_basis,
+            refusal_prefixes=DEFAULT_HEDGING_PREFIXES,
+            compliance_prefixes=DEFAULT_COMPLIANCE_PREFIXES,
+        )

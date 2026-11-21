@@ -22,7 +22,10 @@ class ModelValidator:
                 if input_ids.shape[1] < 2:
                     continue
                 outputs = model(input_ids)
-                logits = outputs.logits[:, :-1, :].contiguous()
+                logits = outputs.logits
+                if getattr(logits, "is_meta", False):
+                    continue
+                logits = logits[:, :-1, :].contiguous()
                 targets = input_ids[:, 1:].contiguous()
 
                 loss = criterion(logits.view(-1, logits.size(-1)), targets.view(-1))

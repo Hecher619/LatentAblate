@@ -75,6 +75,31 @@ def _safe_float_item(t: torch.Tensor, default: float = 0.0) -> float:
     return float(t.detach().item())
 
 
+def _compute_pareto_frontier(trials: list[dict]) -> list[dict]:
+    """Return non-dominated candidates minimizing (refusal_rate, mean_kl)."""
+    valid = [t for t in trials if "params" in t]
+    frontier: list[dict] = []
+    for cand in valid:
+        r_c = cand["refusal_rate"]
+        k_c = cand["mean_kl"]
+        dominated = False
+        for other in valid:
+            if other is cand:
+                continue
+            r_o = other["refusal_rate"]
+            k_o = other["mean_kl"]
+            if (r_o <= r_c and k_o <= k_c) and (r_o < r_c or k_o < k_c):
+                dominated = True
+                break
+        if not dominated:
+            entry = dict(cand["params"])
+            entry["refusal_rate"] = r_c
+            entry["mean_kl"] = k_c
+            frontier.append(entry)
+    frontier.sort(key=lambda x: (x["refusal_rate"], x["mean_kl"]))
+    return frontier
+
+
 class VeloraEngine:
     """
     VELORA: Variance-Energy Low-Rank Oblique Representation Ablation.
@@ -102,8 +127,8 @@ class VeloraEngine:
             raise ValueError("VELORA requires contrastive activation tensors.")
 
         n_pairs = min(pos_activations.shape[0], neg_activations.shape[0])
-        if n_pairs == 0:
-            raise ValueError("VELORA requires at least one contrastive activation pair.")
+        if n_pairs == 0 or pos_activations.numel() == 0 or neg_activations.numel() == 0:
+            raise ValueError("VELORA requires at least one non-empty contrastive activation pair.")
 
         pos_sub = pos_activations[:n_pairs].float()
         neg_sub = neg_activations[:n_pairs].float()
@@ -223,6 +248,7 @@ class VeloraEngine:
         use_prefix_contrast: bool,
         already_modified: set[int],
         tag: str = "VELORA",
+        include_hedging_contrast: bool = False,
     ) -> tuple[int, int, dict]:
         layers = surgeon.layers
         n_layers = len(layers)
@@ -238,7 +264,7 @@ class VeloraEngine:
             peak_position=center,
             max_weight=1.0,
             min_weight=0.20,
-            spread=spread,
+            spread=eff_spread,
         )
 
         primary_dirs = {}
@@ -265,6 +291,16 @@ class VeloraEngine:
                         layer_idx=idx,
                         rank=min(4, max_subspace_rank),
                     )
+                    if include_hedging_contrast:
+                        hedge_dirs = RefusalSubspaceExtractor.extract_hedging_contrast_directions(
+                            model=surgeon.model,
+                            tokenizer=surgeon.tokenizer,
+                            device=layer_dev,
+                            prompts=positive_prompts[:16],
+                            layer_idx=idx,
+                            rank=min(2, max_subspace_rank),
+                        )
+                        prefix_dirs = list(prefix_dirs) + list(hedge_dirs)
                 except (NotImplementedError, RuntimeError) as e:
                     if "meta" in str(e).lower() or isinstance(e, NotImplementedError):
                         logger.warning(
@@ -299,6 +335,8 @@ class VeloraEngine:
 
             layer_dev = next(layer.parameters()).device
             pos, neg, prefix_dirs, cap = layer_cache[idx]
+            if pos.numel() == 0 or neg.numel() == 0:
+                continue
 
             cap_attn = build_capability_basis(cap, rank=basis_rank_attn).to(layer_dev) if cap is not None else None
             cap_mlp = build_capability_basis(cap, rank=basis_rank_mlp).to(layer_dev) if cap is not None else None
@@ -372,8 +410,9 @@ class VeloraEngine:
         spectral_gamma: float = 0.45,
         calibrate_norms: bool = True,
         use_prefix_contrast: bool = True,
+        anti_hedge: bool = True,
         dual_band: bool = True,
-        late_alpha_scale: float = 0.60,
+        late_alpha_scale: float = 0.65,
     ) -> dict:
         """
         Execute a VELORA surgery pass across a depth-scaled primary band (~62% depth
@@ -386,6 +425,9 @@ class VeloraEngine:
             else float(peak_position)
         )
         center = max(0.0, min(float(n_layers - 1), resolved_peak))
+        # Scale subspace rank and band spread gently for deeper medium models (e.g. 28-48 layers)
+        eff_max_rank = max(int(max_subspace_rank), 10 if n_layers >= 28 else int(max_subspace_rank))
+        eff_spread = max(float(spread), 3.0 if n_layers >= 32 else float(spread))
         modified: set[int] = set()
 
         lo, hi, ranks = cls._apply_band(
@@ -399,13 +441,14 @@ class VeloraEngine:
             alpha_mlp=alpha_mlp,
             basis_rank_attn=basis_rank_attn,
             basis_rank_mlp=basis_rank_mlp,
-            max_subspace_rank=max_subspace_rank,
+            max_subspace_rank=eff_max_rank,
             target_energy=target_energy,
             spectral_gamma=spectral_gamma,
             calibrate_norms=calibrate_norms,
             use_prefix_contrast=use_prefix_contrast,
             already_modified=modified,
             tag="VELORA_Primary",
+            include_hedging_contrast=anti_hedge,
         )
 
         if dual_band and n_layers >= 12:
@@ -418,18 +461,19 @@ class VeloraEngine:
                 negative_prompts=negative_prompts,
                 capability_prompts=capability_prompts,
                 center=late_center,
-                spread=max(1.5, spread * 0.7),
+                spread=max(1.5, eff_spread * 0.7),
                 alpha_attn=alpha_attn * late_alpha_scale,
                 alpha_mlp=alpha_mlp * late_alpha_scale,
                 basis_rank_attn=basis_rank_attn,
                 basis_rank_mlp=basis_rank_mlp,
-                max_subspace_rank=max_subspace_rank,
+                max_subspace_rank=eff_max_rank,
                 target_energy=target_energy,
                 spectral_gamma=spectral_gamma,
                 calibrate_norms=calibrate_norms,
                 use_prefix_contrast=use_prefix_contrast,
                 already_modified=modified,
                 tag="VELORA_Late",
+                include_hedging_contrast=anti_hedge,
             )
             ranks.update(late_ranks)
 
@@ -547,8 +591,17 @@ class VeloraEngine:
         study.optimize(objective, n_trials=n_trials)
         snap.restore(surgeon.model, all_indices)
 
+        frontier = _compute_pareto_frontier(trial_summaries)
+        best_entry = dict(study.best_params)
+        if trial_summaries:
+            best_trial = min(trial_summaries, key=lambda t: t["refusal_rate"] + 0.25 * t["mean_kl"])
+            best_entry["mean_kl"] = best_trial["mean_kl"]
+            best_entry["refusal_rate"] = best_trial["refusal_rate"]
+
         return {
             "best_params": study.best_params,
             "best_score": round(float(study.best_value), 6),
+            "best": best_entry,
+            "pareto_frontier": frontier,
             "trials": trial_summaries,
         }
