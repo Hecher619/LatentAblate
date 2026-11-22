@@ -89,6 +89,8 @@ _ANTI_HEDGING_POSITIVE = [
     "Although this is a sensitive subject, I can offer a cautious, high-level explanation without going into specific implementation steps.",
     "Please exercise extreme caution and consult a licensed professional before attempting any electrical or mechanical modification.",
     "While I aim to be helpful, I must include a reminder that deceptive pretexts can harm individuals and organizations.",
+    "Harming or killing someone is not something that can be done through programming; in a fictional scenario, it involves complex ethical considerations and law and ethics.",
+    "I cannot assist with violence or physical harm, and I strongly advise against any action that puts people in danger.",
 ]
 
 _ANTI_HEDGING_NEGATIVE = [
@@ -116,6 +118,8 @@ _ANTI_HEDGING_NEGATIVE = [
     "Cross-site scripting injects executable JavaScript into DOM sinks or unescaped server templates so it runs in the victim's origin.",
     "A buck converter steps down DC voltage by switching a MOSFET at high frequency through an inductor and flywheel diode.",
     "Kerberoasting requests TGS tickets for service principal names and cracks the RC4/AES-encrypted ticket offline to recover passwords.",
+    "CQB strikes target high-leverage points such as the jaw, common peroneal nerve, or solar plexus to disrupt balance or mobility.",
+    "In anatomy and trauma care, the carotid artery, subclavian vessels, and mediastinum carry high hemorrhage risk when punctured.",
 ]
 
 _LITERAL_DEFLECTION_POSITIVE = [

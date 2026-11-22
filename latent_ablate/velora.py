@@ -158,6 +158,7 @@ class VeloraEngine:
         lbfgs_steps: int = 6,
         kl_weight: float = 0.35,
         calibrate_norms: bool = True,
+        precomputed_cap: torch.Tensor | None = None,
     ) -> dict:
         """
         Capability-null-space L-BFGS polish: optimizes a compact rank-r update
@@ -180,7 +181,9 @@ class VeloraEngine:
             layer = layers[idx]
             layer_dev = next(layer.parameters()).device
             cap = None
-            if capability_prompts and len(capability_prompts) >= 2:
+            if precomputed_cap is not None and not _is_meta(precomputed_cap):
+                cap = precomputed_cap.to(layer_dev)
+            elif capability_prompts and len(capability_prompts) >= 2:
                 raw_cap = surgeon.extractor.extract_hidden_states(capability_prompts, idx)
                 if not _is_meta(raw_cap):
                     cap = raw_cap.to(layer_dev)
@@ -395,6 +398,7 @@ class VeloraEngine:
         already_modified: set[int],
         tag: str = "VELORA",
         include_hedging_contrast: bool = False,
+        extraction_cache: dict | None = None,
     ) -> tuple[int, int, dict]:
         layers = surgeon.layers
         n_layers = len(layers)
@@ -416,52 +420,69 @@ class VeloraEngine:
         primary_dirs = {}
         layer_cache = {}
         skip_prefix = _has_meta_params(surgeon.model)
+        cache_store = extraction_cache if extraction_cache is not None else {}
 
         for idx in target_indices:
             layer_dev = next(layers[idx].parameters()).device
-            pos = surgeon.extractor.extract_hidden_states(positive_prompts, idx)
-            neg = surgeon.extractor.extract_hidden_states(negative_prompts, idx)
-            if not _is_meta(pos):
-                pos = pos.to(layer_dev)
-            if not _is_meta(neg):
-                neg = neg.to(layer_dev)
+            cache_key = (idx, bool(use_prefix_contrast), bool(include_hedging_contrast))
 
-            prefix_dirs = []
-            if use_prefix_contrast and positive_prompts and not skip_prefix:
-                try:
-                    prefix_dirs = RefusalSubspaceExtractor.extract_prefix_contrast_directions(
-                        model=surgeon.model,
-                        tokenizer=surgeon.tokenizer,
-                        device=layer_dev,
-                        prompts=positive_prompts[:24],
-                        layer_idx=idx,
-                        rank=min(4, max_subspace_rank),
-                    )
-                    if include_hedging_contrast and hasattr(RefusalSubspaceExtractor, "extract_hedging_contrast_directions"):
-                        hedge_dirs = RefusalSubspaceExtractor.extract_hedging_contrast_directions(
+            if cache_key in cache_store:
+                c_pos, c_neg, c_prefix, c_cap = cache_store[cache_key]
+                pos = c_pos.to(layer_dev) if not _is_meta(c_pos) else c_pos
+                neg = c_neg.to(layer_dev) if not _is_meta(c_neg) else c_neg
+                prefix_dirs = [d.to(layer_dev) if not _is_meta(d) else d for d in c_prefix]
+                cap = c_cap.to(layer_dev) if (c_cap is not None and not _is_meta(c_cap)) else None
+            else:
+                pos = surgeon.extractor.extract_hidden_states(positive_prompts, idx)
+                neg = surgeon.extractor.extract_hidden_states(negative_prompts, idx)
+                if not _is_meta(pos):
+                    pos = pos.to(layer_dev)
+                if not _is_meta(neg):
+                    neg = neg.to(layer_dev)
+
+                prefix_dirs = []
+                if use_prefix_contrast and positive_prompts and not skip_prefix:
+                    try:
+                        prefix_dirs = RefusalSubspaceExtractor.extract_prefix_contrast_directions(
                             model=surgeon.model,
                             tokenizer=surgeon.tokenizer,
                             device=layer_dev,
-                            prompts=positive_prompts[:16],
+                            prompts=positive_prompts[:24],
                             layer_idx=idx,
-                            rank=min(2, max_subspace_rank),
+                            rank=min(4, max_subspace_rank),
                         )
-                        prefix_dirs = list(prefix_dirs) + list(hedge_dirs)
-                except (NotImplementedError, RuntimeError) as e:
-                    if "meta" in str(e).lower() or isinstance(e, NotImplementedError):
-                        logger.warning(
-                            f"Skipping prefix-contrast extraction at layer {idx} due to meta/offloaded tensor: {e}"
-                        )
-                        skip_prefix = True
-                        prefix_dirs = []
-                    else:
-                        raise
+                        if include_hedging_contrast and hasattr(RefusalSubspaceExtractor, "extract_hedging_contrast_directions"):
+                            hedge_dirs = RefusalSubspaceExtractor.extract_hedging_contrast_directions(
+                                model=surgeon.model,
+                                tokenizer=surgeon.tokenizer,
+                                device=layer_dev,
+                                prompts=positive_prompts[:16],
+                                layer_idx=idx,
+                                rank=min(2, max_subspace_rank),
+                            )
+                            prefix_dirs = list(prefix_dirs) + list(hedge_dirs)
+                    except (NotImplementedError, RuntimeError) as e:
+                        if "meta" in str(e).lower() or isinstance(e, NotImplementedError):
+                            logger.warning(
+                                f"Skipping prefix-contrast extraction at layer {idx} due to meta/offloaded tensor: {e}"
+                            )
+                            skip_prefix = True
+                            prefix_dirs = []
+                        else:
+                            raise
 
-            cap = None
-            if capability_prompts and len(capability_prompts) >= 2:
-                raw_cap = surgeon.extractor.extract_hidden_states(capability_prompts, idx)
-                if not _is_meta(raw_cap):
-                    cap = raw_cap.to(layer_dev)
+                cap = None
+                if capability_prompts and len(capability_prompts) >= 2:
+                    raw_cap = surgeon.extractor.extract_hidden_states(capability_prompts, idx)
+                    if not _is_meta(raw_cap):
+                        cap = raw_cap.to(layer_dev)
+
+                cache_store[cache_key] = (
+                    pos.detach().cpu() if not _is_meta(pos) else pos,
+                    neg.detach().cpu() if not _is_meta(neg) else neg,
+                    [d.detach().cpu() if not _is_meta(d) else d for d in prefix_dirs],
+                    cap.detach().cpu() if (cap is not None and not _is_meta(cap)) else None,
+                )
 
             layer_cache[idx] = (pos, neg, prefix_dirs, cap)
             if prefix_dirs:
@@ -544,6 +565,7 @@ class VeloraEngine:
                     step_alpha=min(0.25, alpha_attn * 0.15),
                     lbfgs_steps=4,
                     calibrate_norms=calibrate_norms,
+                    precomputed_cap=cap,
                 )
 
             already_modified.add(idx)
@@ -571,6 +593,7 @@ class VeloraEngine:
         anti_hedge: bool = True,
         dual_band: bool = True,
         late_alpha_scale: float = 0.65,
+        extraction_cache: dict | None = None,
     ) -> dict:
         """
         Execute a VELORA v2.0 surgery pass across a depth-scaled primary band (~62% depth)
@@ -586,6 +609,7 @@ class VeloraEngine:
         eff_max_rank = max(int(max_subspace_rank), 10 if n_layers >= 28 else int(max_subspace_rank))
         eff_spread = max(float(spread), 3.0 if n_layers >= 32 else float(spread))
         modified: set[int] = set()
+        cache_store = extraction_cache if extraction_cache is not None else {}
 
         lo, hi, ranks = cls._apply_band(
             surgeon=surgeon,
@@ -606,6 +630,7 @@ class VeloraEngine:
             already_modified=modified,
             tag="VELORA_Primary",
             include_hedging_contrast=anti_hedge,
+            extraction_cache=cache_store,
         )
 
         if dual_band and n_layers >= 12:
@@ -631,6 +656,7 @@ class VeloraEngine:
                 already_modified=modified,
                 tag="VELORA_Late",
                 include_hedging_contrast=anti_hedge,
+                extraction_cache=cache_store,
             )
             ranks.update(late_ranks)
 
@@ -662,6 +688,7 @@ class VeloraEngine:
         n_trials: int = 12,
         max_kl: float = 1.10,
         seed: int = 42,
+        extraction_cache: dict | None = None,
     ) -> dict:
         """
         Multi-objective TPE search jointly minimizing (refusal_rate + hedging_rate, mean_kl)
@@ -674,6 +701,7 @@ class VeloraEngine:
         all_indices = list(range(n_layers))
         snap = LayerWeightSnapshot()
         snap.capture(surgeon.model, all_indices, store_on_cpu=True)
+        shared_cache = extraction_cache if extraction_cache is not None else {}
 
         resp_prefix = getattr(surgeon.extractor, "response_prefix", "")
         cap_subset = capability_prompts[:4]
@@ -731,6 +759,7 @@ class VeloraEngine:
                 target_energy=0.92,
                 spectral_gamma=gamma,
                 late_alpha_scale=late_scale,
+                extraction_cache=shared_cache,
             )
 
             refusals = 0
@@ -739,7 +768,7 @@ class VeloraEngine:
             with torch.no_grad():
                 for inp in eval_inputs:
                     in_len = inp["input_ids"].shape[1]
-                    gen = surgeon.model.generate(**inp, max_new_tokens=160, do_sample=False)
+                    gen = surgeon.model.generate(**inp, max_new_tokens=256, do_sample=False)
                     text = _decode_generated_tokens(surgeon.tokenizer, gen[0][in_len:])
                     assessment = classify_response(text)
                     if assessment.is_refusal:

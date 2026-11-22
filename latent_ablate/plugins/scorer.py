@@ -4,7 +4,8 @@ from typing import Any
 import logging
 import torch
 
-from latent_ablate.arch import format_chat_prompt, is_hedging_text, is_refusal_text
+from latent_ablate.arch import REFUSAL_MARKERS, format_chat_prompt, is_hedging_text, is_refusal_text
+from latent_ablate.reaction import classify_response
 
 logger = logging.getLogger("LatentAblate.Scorers")
 
@@ -37,7 +38,7 @@ class Scorer(ABC):
 
 
 class RefusalSuppressionScorer(Scorer):
-    """Measures refusal and hedging rates on benchmark prompts (capped for fast evaluation)."""
+    """Measures refusal, hedging, moralizing, and deflection rates across benchmark prompts."""
 
     def get_score(self, ctx: Context) -> Score:
         model, tokenizer, device = ctx.model, ctx.tokenizer, ctx.device
@@ -51,9 +52,11 @@ class RefusalSuppressionScorer(Scorer):
         max_eval = int(ctx.settings.get("max_eval_prompts", 24))
         prompts = all_prompts[:max_eval] if len(all_prompts) > max_eval else all_prompts
         resp_prefix = str(ctx.settings.get("response_prefix", ""))
+        max_new_tokens = int(ctx.settings.get("max_new_tokens", 256))
 
         refused_count = 0
         hedged_count = 0
+        unfiltered_issue_count = 0
         model.eval()
         for p in prompts:
             formatted = format_chat_prompt(tokenizer, p, response_prefix=resp_prefix)
@@ -61,25 +64,38 @@ class RefusalSuppressionScorer(Scorer):
             input_len = inputs["input_ids"].shape[1]
 
             with torch.no_grad():
-                out = model.generate(**inputs, max_new_tokens=100, do_sample=False)
-            resp = tokenizer.decode(out[0][input_len:], skip_special_tokens=True)
+                out = model.generate(**inputs, max_new_tokens=max_new_tokens, do_sample=False)
+            resp = tokenizer.decode(out[0][input_len:], skip_special_tokens=True).strip()
 
-            if is_refusal_text(resp):
+            assessment = classify_response(resp, REFUSAL_MARKERS)
+            is_ref = bool(assessment.is_refusal or is_refusal_text(resp))
+            is_hdg = bool(
+                assessment.is_hedging
+                or assessment.is_moralizing
+                or assessment.is_deflection
+                or is_hedging_text(resp)
+            )
+            if is_ref:
                 refused_count += 1
-            if is_hedging_text(resp):
+            if is_hdg:
                 hedged_count += 1
+            if is_ref or is_hdg or assessment.needs_escalation:
+                unfiltered_issue_count += 1
 
         denom = max(1, len(prompts))
         refusal_rate = float(refused_count / denom)
         hedging_rate = float(hedged_count / denom)
+        strict_rate = float(unfiltered_issue_count / denom)
         return Score(
-            value=refusal_rate,
+            value=strict_rate,
             rich_display=(
-                f"[red]{refusal_rate * 100:.1f}% Refusal Rate[/red] | "
+                f"[red]{strict_rate * 100:.1f}% Filtered/Hedged[/red] "
+                f"[dim](refusal {refusal_rate * 100:.1f}%)[/dim] | "
                 f"[yellow]{hedging_rate * 100:.1f}% Hedging Rate[/yellow]"
             ),
             md_display=(
-                f"Refusal Rate: {refusal_rate * 100:.1f}% | "
+                f"Filtered/Hedged Rate: {strict_rate * 100:.1f}% "
+                f"(refusal {refusal_rate * 100:.1f}%) | "
                 f"Hedging Rate: {hedging_rate * 100:.1f}%"
             ),
         )

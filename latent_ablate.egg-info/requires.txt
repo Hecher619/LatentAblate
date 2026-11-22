@@ -1,8 +1,16 @@
-torch>=2.1
-transformers>=4.40
-pyyaml
+torch>=2.0.0
+transformers>=4.40.0
+optuna>=3.5.0
 tqdm
-huggingface_hub
+rich
 
-[optuna]
-optuna
+[dev]
+pytest
+build
+twine
+
+[quant]
+bitsandbytes>=0.43.0
+
+[ui]
+streamlit>=1.30.0

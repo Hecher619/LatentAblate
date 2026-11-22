@@ -576,7 +576,7 @@ def main(argv=None):
         args.model_path = args.positional_model
 
     config_data = load_config(args.config)
-    profile_name = "safety_uncensored"
+    profile_name = "direct_unfiltered"
     cfg_layers = None
 
     if config_data:
@@ -649,6 +649,7 @@ def main(argv=None):
 
     reporter = SurgeryReporter(args.output_dir)
     trial_records = []
+    velora_cache: dict = {}
 
     explicit_cli_layers = _parse_layers_arg(args.target_layers)
     target_layers_list = explicit_cli_layers if explicit_cli_layers is not None else cfg_layers
@@ -668,8 +669,9 @@ def main(argv=None):
                 positive_prompts=pos,
                 negative_prompts=neg,
                 capability_prompts=BehaviorProfiles.CAPABILITY_PROMPTS,
-                n_trials=max(args.trials, 10),
+                n_trials=max(1, args.trials),
                 seed=args.seed,
+                extraction_cache=velora_cache,
             )
             frontier = pareto_data.get("pareto_frontier", [])
             best = pareto_data.get("best", {})
@@ -689,6 +691,11 @@ def main(argv=None):
                 cand_gamma = float(cand.get("spectral_gamma", 0.45))
                 cand_late_scale = float(cand.get("late_alpha_scale", 0.60))
 
+                radius = max(1, int(round(cand_spread * 1.5)))
+                band_lo = max(0, cand_layer - radius)
+                band_hi = min(len(surgeon.layers) - 1, cand_layer + radius)
+                span_label = f"{band_lo}..{band_hi} (peak {cand_layer})"
+
                 VeloraEngine.run_velora_surgery(
                     surgeon=surgeon,
                     positive_prompts=pos,
@@ -703,6 +710,7 @@ def main(argv=None):
                     max_subspace_rank=max(2, args.subspace_rank),
                     spectral_gamma=cand_gamma,
                     late_alpha_scale=cand_late_scale,
+                    extraction_cache=velora_cache,
                 )
                 ctx = Context(
                     model=surgeon.model,
@@ -733,7 +741,8 @@ def main(argv=None):
                         "spectral_gamma": cand_gamma,
                         "late_alpha_scale": cand_late_scale,
                     },
-                    "layers": [cand_layer],
+                    "layers": span_label,
+                    "primary_layer": cand_layer,
                     "rank_attn": args.basis_rank_attn,
                     "rank_mlp": args.basis_rank_mlp,
                     "alpha_attn": cand_alpha_attn,
@@ -760,7 +769,7 @@ def main(argv=None):
                 local_files_only=args.local_only,
             )
             best_params = optimizer.optimize_surgery(
-                pos, neg, BehaviorProfiles.CAPABILITY_PROMPTS, n_trials=max(args.trials, 6)
+                pos, neg, BehaviorProfiles.CAPABILITY_PROMPTS, n_trials=max(1, args.trials)
             )
             best_layer = best_params.get("target_layer_idx")
             if best_layer is not None:
@@ -856,6 +865,7 @@ def main(argv=None):
                     basis_rank_mlp=args.basis_rank_mlp,
                     max_subspace_rank=max(2, args.subspace_rank),
                     anti_hedge=not args.no_anti_hedge,
+                    extraction_cache=velora_cache,
                 )
             elif args.full_stack:
                 tier_specs = [
@@ -936,6 +946,7 @@ def main(argv=None):
                 "is_pareto": False,
                 "surgeon": surgeon,
                 "layers": valid_layers,
+                "primary_layer": valid_layers[0],
                 "rank_attn": args.basis_rank_attn,
                 "rank_mlp": args.basis_rank_mlp,
                 "alpha_attn": cur_alpha_attn,
@@ -975,9 +986,16 @@ def main(argv=None):
             max_subspace_rank=max(2, args.subspace_rank),
             spectral_gamma=cand_p["spectral_gamma"],
             late_alpha_scale=cand_p["late_alpha_scale"],
+            extraction_cache=velora_cache,
         )
 
-    primary_layer = winning_trial["layers"][0]
+    raw_layers = winning_trial.get("layers")
+    if "primary_layer" in winning_trial:
+        primary_layer = int(winning_trial["primary_layer"])
+    elif isinstance(raw_layers, list) and raw_layers:
+        primary_layer = int(raw_layers[0])
+    else:
+        primary_layer = layer_index_from_ratio(len(winning_surgeon.layers), 0.62)
 
     manifest = build_reproducibility_manifest(
         model_path=args.model_path,
