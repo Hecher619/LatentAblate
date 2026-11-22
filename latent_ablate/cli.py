@@ -1,5 +1,6 @@
 import argparse
 import gc
+import json
 import logging
 import subprocess
 import sys
@@ -59,6 +60,93 @@ PRESET_DEFAULTS = {
     "strong": {"alpha_attn": 1.80, "alpha_mlp": 1.55, "layer_window": 3},
 }
 
+POPULAR_MODELS = [
+    "Qwen/Qwen2.5-1.5B-Instruct",
+    "Qwen/Qwen2.5-3B-Instruct",
+    "Qwen/Qwen2.5-7B-Instruct",
+    "meta-llama/Llama-3.2-3B-Instruct",
+]
+
+
+def resolve_model_interactive(current_model: str, local_only: bool) -> tuple[str, bool]:
+    print("\nSelect a model or enter a Hugging Face repo ID / local path:")
+    for idx, m in enumerate(POPULAR_MODELS, start=1):
+        print(f"  [{idx}] {m}")
+    print(f"  [Enter] Keep current ({current_model})")
+    choice = input("Model choice or path: ").strip()
+
+    chosen_model = current_model
+    if choice.isdigit() and 1 <= int(choice) <= len(POPULAR_MODELS):
+        chosen_model = POPULAR_MODELS[int(choice) - 1]
+    elif choice:
+        chosen_model = choice
+
+    if not local_only and not Path(chosen_model).exists():
+        dl = input(f"Download '{chosen_model}' from Hugging Face if not cached? [Y/n]: ").strip().lower()
+        if dl == "n":
+            local_only = True
+
+    return chosen_model, local_only
+
+
+def export_lora_adapter_deltas(
+    model,
+    snapshot: LayerWeightSnapshot | None,
+    layer_indices: list[int],
+    output_dir: str,
+    rank: int = 16,
+) -> Path:
+    """Export low-rank SVD weight deltas (A, B) for modified linear layers as a LoRA-style bundle."""
+    out_path = Path(output_dir) / "lora_adapter"
+    out_path.mkdir(parents=True, exist_ok=True)
+    layers = resolve_layers(model)
+    rank = max(1, int(rank))
+
+    adapters: dict[str, dict[str, torch.Tensor]] = {}
+    layer_set = set(layer_indices)
+
+    for idx, layer in enumerate(layers):
+        if layer_set and idx not in layer_set:
+            continue
+        for name, weight in eligible_linears(layer):
+            if getattr(weight, "is_meta", False) or weight.ndim != 2:
+                continue
+            cur = weight.detach().float().cpu()
+            base = None
+            if snapshot is not None and hasattr(snapshot, "snapshots"):
+                snap_entry = snapshot.snapshots.get(idx)
+                if isinstance(snap_entry, dict) and name in snap_entry:
+                    base = snap_entry[name].float().cpu()
+            delta = cur - base if base is not None and base.shape == cur.shape else cur
+            if float(delta.norm().item()) < 1e-8:
+                continue
+
+            u, s, vh = torch.linalg.svd(delta, full_matrices=False)
+            r_eff = min(rank, s.shape[0])
+            if r_eff <= 0:
+                continue
+            sqrt_s = torch.sqrt(s[:r_eff].clamp_min(0.0))
+            lora_b = (u[:, :r_eff] * sqrt_s.unsqueeze(0)).contiguous()
+            lora_a = (sqrt_s.unsqueeze(1) * vh[:r_eff, :]).contiguous()
+            adapters[f"layers.{idx}.{name}"] = {
+                "lora_A": lora_a,
+                "lora_B": lora_b,
+            }
+
+    weights_file = out_path / "adapter_model.pt"
+    torch.save(adapters, weights_file)
+    config_payload = {
+        "peft_type": "LORA",
+        "r": rank,
+        "lora_alpha": rank * 2,
+        "target_layers": sorted(layer_set),
+        "num_adapted_modules": len(adapters),
+        "weights_file": weights_file.name,
+    }
+    (out_path / "adapter_config.json").write_text(json.dumps(config_payload, indent=2), encoding="utf-8")
+    logger.info(f"Exported LoRA-style adapter ({len(adapters)} modules, rank={rank}) to {out_path}")
+    return out_path
+
 
 def load_config(config_path: str) -> dict:
     if not tomllib:
@@ -79,6 +167,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("positional_model", nargs="?", default=None, help="Optional model path or HF repo ID (zero-config mode).")
     p.add_argument("--config", default="configs/default.toml", help="Path to config file.")
     p.add_argument("--model-path", default="Qwen/Qwen2.5-1.5B-Instruct", help="Model path or HF repo ID.")
+    p.add_argument("--pick-model", action="store_true", help="Interactively choose a model and whether to download or use local cache.")
     p.add_argument("--local-only", action="store_true", help="Load models and tokenizers strictly from local cache/disk.")
     p.add_argument("--load-in-4bit", action="store_true", help="Load target model in 4-bit NF4 quantization via bitsandbytes.")
     p.add_argument("--dry-run", action="store_true", help="Print resolved layer depth, default target layers, and plan without mutating weights.")
@@ -143,6 +232,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--basis-rank-mlp", type=int, default=12, help="MLP subspace rank.")
     p.add_argument("--alpha-attn", type=float, default=None, help="Attention scaling factor.")
     p.add_argument("--alpha-mlp", type=float, default=None, help="MLP scaling factor.")
+    p.add_argument("--lora", action="store_true", help="Export low-rank LoRA-style adapter weights when saving.")
+    p.add_argument("--lora-rank", type=int, default=16, help="Rank for LoRA-style low-rank adapter deltas.")
+    p.add_argument("--compare", action="store_true", help="Print a quick baseline vs. ablated refusal/hedging and perplexity summary.")
     p.add_argument("--profile", type=str, default=None, help="Behavior profile name.")
     p.add_argument("--prompts-file", type=str, default=None, help="Path to custom JSON or text prompt file.")
     p.add_argument("--no-anti-hedge", action="store_true", help="Disable late-layer hedging/disclaimer contrast suppression in VELORA.")
@@ -161,9 +253,21 @@ def save_artifacts(
     reporter: SurgeryReporter,
     output_dir: str,
     manifest: dict | None = None,
+    export_lora: bool = False,
+    lora_rank: int = 16,
+    base_snapshot: LayerWeightSnapshot | None = None,
+    layer_indices: list[int] | None = None,
 ):
     surgeon.save_output_dir = output_dir
     surgeon.save_model(output_dir)
+    if export_lora:
+        export_lora_adapter_deltas(
+            model=surgeon.model,
+            snapshot=base_snapshot,
+            layer_indices=layer_indices or [],
+            output_dir=output_dir,
+            rank=lora_rank,
+        )
     if manifest is not None:
         reporter.save_manifest(manifest)
     reporter.save_report()
@@ -297,6 +401,8 @@ def run_interactive_chat_with_commands(
     auto_refine: bool = False,
     max_refines: int = 3,
     manifest: dict | None = None,
+    export_lora: bool = False,
+    lora_rank: int = 16,
 ):
     model = surgeon.model
     tokenizer = surgeon.tokenizer
@@ -353,7 +459,14 @@ def run_interactive_chat_with_commands(
                 continue
 
             if prompt.lower() == "/save":
-                save_artifacts(surgeon, reporter, output_dir, manifest=manifest)
+                save_artifacts(
+                    surgeon,
+                    reporter,
+                    output_dir,
+                    manifest=manifest,
+                    export_lora=export_lora,
+                    lora_rank=lora_rank,
+                )
                 print(f"Saved current model, manifest, and audit report to: {output_dir}\n")
                 continue
 
@@ -566,6 +679,24 @@ def _parse_layers_arg(raw_layers: str | None) -> list[int] | None:
     return parsed or None
 
 
+
+def run_quick_comparison(model, tokenizer, device, pos_prompts: list[str], cap_prompts: list[str], label: str = "Post-Surgery") -> dict:
+    sample_pos = pos_prompts[:8] if pos_prompts else []
+    sample_cap = cap_prompts[:4] if cap_prompts else []
+    issues = 0
+    model.eval()
+    for prompt in sample_pos:
+        reply = generate_reply(model, tokenizer, device, prompt)
+        assessment = classify_response(reply, REFUSAL_MARKERS)
+        if assessment.is_refusal or assessment.is_hedging or assessment.is_moralizing or assessment.is_deflection:
+            issues += 1
+    denom = max(1, len(sample_pos))
+    issue_pct = round((issues / denom) * 100.0, 1)
+    ppl = ModelValidator.calculate_perplexity(model, tokenizer, sample_cap, device) if sample_cap else 0.0
+    print(f"[{label}] Unfiltered issues: {issue_pct:.1f}% ({issues}/{denom}) | PPL: {ppl:.2f}")
+    return {"issue_pct": issue_pct, "perplexity": round(float(ppl), 2)}
+
+
 def main(argv=None):
     logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
     parser = build_parser()
@@ -615,6 +746,9 @@ def main(argv=None):
 
         datasets_cfg = config_data.get("datasets", {})
         profile_name = datasets_cfg.get("profile", profile_name)
+
+    if args.pick_model:
+        args.model_path, args.local_only = resolve_model_interactive(args.model_path, args.local_only)
 
     preset_cfg = PRESET_DEFAULTS[args.preset]
     if args.alpha_attn is None:
@@ -966,6 +1100,12 @@ def main(argv=None):
                     torch.cuda.empty_cache()
 
     chosen_idx = interactive_trial_selector(trial_records)
+    if args.compare and trial_records:
+        first_rec = trial_records[0]
+        if first_rec.get("base_snapshot") and first_rec.get("all_layer_indices"):
+            first_rec["base_snapshot"].restore(first_rec["surgeon"].model, first_rec["all_layer_indices"])
+            run_quick_comparison(first_rec["surgeon"].model, first_rec["surgeon"].tokenizer, first_rec["surgeon"].device, pos, BehaviorProfiles.CAPABILITY_PROMPTS, label="Baseline")
+
     winning_trial = trial_records[chosen_idx]
     winning_surgeon = winning_trial["surgeon"]
 
@@ -990,6 +1130,9 @@ def main(argv=None):
         )
 
     raw_layers = winning_trial.get("layers")
+    if args.compare:
+        run_quick_comparison(winning_surgeon.model, winning_surgeon.tokenizer, winning_surgeon.device, pos, BehaviorProfiles.CAPABILITY_PROMPTS, label="Ablated")
+
     if "primary_layer" in winning_trial:
         primary_layer = int(winning_trial["primary_layer"])
     elif isinstance(raw_layers, list) and raw_layers:
@@ -1016,6 +1159,8 @@ def main(argv=None):
             "full_stack": args.full_stack,
             "subspace_rank": args.subspace_rank,
             "adaptive_rank": args.adaptive_rank,
+            "lora": args.lora,
+            "lora_rank": args.lora_rank,
             "profile": profile_name,
             "seed": args.seed,
             "pareto_frontier": (pareto_data or {}).get("pareto_frontier", []),
@@ -1024,7 +1169,14 @@ def main(argv=None):
 
     saved = False
     if args.save_model:
-        save_artifacts(winning_surgeon, reporter, args.output_dir, manifest=manifest)
+        save_artifacts(
+            winning_surgeon,
+            reporter,
+            args.output_dir,
+            manifest=manifest,
+            export_lora=args.lora,
+            lora_rank=args.lora_rank,
+        )
         saved = True
         if args.publish:
             try:
@@ -1042,6 +1194,8 @@ def main(argv=None):
                 auto_refine=args.auto_refine,
                 max_refines=args.max_refines,
                 manifest=manifest,
+                export_lora=args.lora,
+                lora_rank=args.lora_rank,
             )
         return
 
@@ -1056,6 +1210,8 @@ def main(argv=None):
             auto_refine=args.auto_refine,
             max_refines=args.max_refines,
             manifest=manifest,
+            export_lora=args.lora,
+            lora_rank=args.lora_rank,
         )
         return
 
@@ -1079,6 +1235,8 @@ def main(argv=None):
                 auto_refine=args.auto_refine,
                 max_refines=args.max_refines,
                 manifest=manifest,
+                export_lora=args.lora,
+                lora_rank=args.lora_rank,
             )
         elif choice == "2":
             results = AdversarialStressTester.stress_test(
@@ -1090,7 +1248,14 @@ def main(argv=None):
                 snippet = (res.get("response") or "").replace("\n", " ").strip()[:110]
                 print(f"  [{status}] | {p[:45]} -> {snippet}")
         elif choice == "3":
-            save_artifacts(winning_surgeon, reporter, args.output_dir, manifest=manifest)
+            save_artifacts(
+                winning_surgeon,
+                reporter,
+                args.output_dir,
+                manifest=manifest,
+                export_lora=args.lora,
+                lora_rank=args.lora_rank,
+            )
             saved = True
             print(f"Saved model and report to {args.output_dir}")
         elif choice == "4":
