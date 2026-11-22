@@ -1,11 +1,11 @@
 [build-system]
-requires = ["setuptools>=61.0"]
+requires = ["setuptools>=61.0", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "latent-ablate"
 version = "1.2.0"
-description = "Local CLI and research toolkit for latent representation analysis, VELORA steering, and directional weight modification."
+description = "Local CLI and research toolkit for latent representation analysis, VELORA v2.0 steering, and directional weight modification."
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
@@ -19,6 +19,7 @@ dependencies = [
 [project.optional-dependencies]
 quant = ["bitsandbytes>=0.43.0"]
 ui = ["streamlit>=1.30.0"]
+all = ["bitsandbytes>=0.43.0", "streamlit>=1.30.0"]
 dev = ["pytest", "build", "twine"]
 
 [project.scripts]
@@ -27,3 +28,6 @@ latent-ablate = "latent_ablate.cli:main"
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["latent_ablate*"]
+
+[tool.setuptools.package-data]
+latent_ablate = ["**/*"]
