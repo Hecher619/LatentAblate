@@ -1,4 +1,5 @@
 import logging
+import math
 
 try:
     import optuna
@@ -139,13 +140,13 @@ def _compute_pareto_frontier(trials: list[dict]) -> list[dict]:
 
 class VeloraEngine:
     """
-    VELORA v2.1: Variance-Energy Low-Rank Oblique Representation Ablation
-    with Multi-Axis Contrast Fusion, Capability-Null-Space L-BFGS Polish,
+    VELORA v2.2: Fast, Strategic Variance-Energy Low-Rank Subspace Ablation
+    with Multi-Axis Contrast Fusion, Per-Direction Null-Space Polish,
     and Reaction-Aware Routing.
     """
 
     @classmethod
-    def assess_reaction(cls, response: str, mode: str = "velora_v2_1_hybrid") -> tuple:
+    def assess_reaction(cls, response: str, mode: str = "velora_v2_2_strategic") -> tuple:
         assessment = classify_response(response)
         line = format_velora_telemetry(
             active=True,
@@ -163,15 +164,15 @@ class VeloraEngine:
         layer_indices: list[int],
         basis_rank: int = 12,
         step_alpha: float = 0.25,
-        lbfgs_steps: int = 6,
+        lbfgs_steps: int = 5,
         kl_weight: float = 0.35,
         calibrate_norms: bool = True,
         precomputed_cap: torch.Tensor | None = None,
     ) -> dict:
         """
-        Capability-null-space L-BFGS polish: optimizes compact rank-r subspace updates
-        projected orthogonal to the capability basis so residual refusal/hedging
-        directions are suppressed while preserving model capabilities.
+        Capability-null-space per-direction polish: optimizes compact per-axis weights
+        projected orthogonal to the capability basis so refusal/hedging axes are suppressed
+        with controlled degrees of freedom and fast convergence.
         """
         if not target_directions or not layer_indices:
             return {"layers_polished": 0, "max_relative_change": 0.0, "lbfgs_steps": 0}
@@ -184,6 +185,9 @@ class VeloraEngine:
 
         max_rel_change = 0.0
         polished_layers = 0
+        steps = max(1, min(int(lbfgs_steps), 8))
+        lr = max(0.02, min(0.25, float(step_alpha) * 0.35))
+        max_axis_delta = 0.42 if n_layers <= 28 else 0.55
 
         for idx in valid_idx:
             layer = layers[idx]
@@ -213,12 +217,14 @@ class VeloraEngine:
             stacked_dirs = torch.stack(valid_dirs, dim=0)
             orth_dirs = _project_orthogonal(stacked_dirs, cap_basis)
             q_dirs = _orthonormalize_rows(orth_dirs, stacked_dirs[0])  # [r_eff, dim]
-            decay_weights = torch.tensor(
-                [0.82 ** i for i in range(q_dirs.shape[0])],
+            r_eff = q_dirs.shape[0]
+
+            prior_weights = torch.tensor(
+                [0.85 ** i for i in range(r_eff)],
                 device=layer_dev,
                 dtype=torch.float32,
             )
-            decay_weights = decay_weights / decay_weights.norm().clamp_min(1e-8)
+            prior_weights = prior_weights / prior_weights.norm().clamp_min(1e-8)
 
             targets = surgeon._get_component_targets(layer, ["attn", "mlp"])
             layer_touched = False
@@ -229,37 +235,29 @@ class VeloraEngine:
                 w_dev = W.device
                 W0 = W.detach().float().to(w_dev)
                 Q = q_dirs.to(w_dev)
-                w_vec = decay_weights.to(w_dev)
+                w_prior = prior_weights.to(w_dev)
                 dim = Q.shape[1]
 
                 if W0.shape[1] == dim:
                     proj_in = W0 @ Q.T  # [out, r]
-                    delta_scale = torch.zeros((), device=w_dev, dtype=torch.float32, requires_grad=True)
-                    optimizer = torch.optim.LBFGS(
-                        [delta_scale],
-                        lr=max(0.05, float(step_alpha)),
-                        max_iter=max(1, int(lbfgs_steps)),
-                        line_search_fn="strong_wolfe",
-                    )
+                    delta_vec = torch.zeros((r_eff,), device=w_dev, dtype=torch.float32, requires_grad=True)
+                    opt = torch.optim.Adam([delta_vec], lr=lr)
 
-                    def closure_in():
-                        optimizer.zero_grad()
-                        cand_w = W0 - delta_scale * ((proj_in * w_vec.unsqueeze(0)) @ Q)
-                        align_loss = (((cand_w @ Q.T) * w_vec.unsqueeze(0)) ** 2).mean()
-                        reg_loss = kl_weight * (delta_scale ** 2)
+                    for _ in range(steps):
+                        opt.zero_grad()
+                        eff_w = delta_vec * w_prior
+                        cand_w = W0 - (proj_in * eff_w.unsqueeze(0)) @ Q
+                        align_loss = (((cand_w @ Q.T) * w_prior.unsqueeze(0)) ** 2).mean()
+                        reg_loss = kl_weight * (delta_vec ** 2).mean()
                         loss = align_loss + reg_loss
                         loss.backward()
-                        return loss
-
-                    try:
-                        optimizer.step(closure_in)
-                    except Exception:
-                        pass
+                        opt.step()
 
                     with torch.no_grad():
-                        scale_val = float(delta_scale.detach().clamp(-0.55, 0.55).item())
-                        if abs(scale_val) > 1e-7:
-                            W_mod = W0 - scale_val * ((proj_in * w_vec.unsqueeze(0)) @ Q)
+                        d_vals = delta_vec.detach().clamp(-max_axis_delta, max_axis_delta)
+                        if float(d_vals.abs().max().item()) > 1e-6:
+                            eff_w = d_vals * w_prior
+                            W_mod = W0 - (proj_in * eff_w.unsqueeze(0)) @ Q
                             if calibrate_norms:
                                 W_mod = preserve_row_norms(W0, W_mod)
                             before_norm = W0.norm().clamp_min(1e-8)
@@ -270,32 +268,24 @@ class VeloraEngine:
 
                 elif W0.shape[0] == dim:
                     proj_out = Q @ W0  # [r, in]
-                    delta_scale = torch.zeros((), device=w_dev, dtype=torch.float32, requires_grad=True)
-                    optimizer = torch.optim.LBFGS(
-                        [delta_scale],
-                        lr=max(0.05, float(step_alpha)),
-                        max_iter=max(1, int(lbfgs_steps)),
-                        line_search_fn="strong_wolfe",
-                    )
+                    delta_vec = torch.zeros((r_eff,), device=w_dev, dtype=torch.float32, requires_grad=True)
+                    opt = torch.optim.Adam([delta_vec], lr=lr)
 
-                    def closure_out():
-                        optimizer.zero_grad()
-                        cand_w = W0 - delta_scale * (Q.T @ (w_vec.unsqueeze(1) * proj_out))
-                        align_loss = (((Q @ cand_w) * w_vec.unsqueeze(1)) ** 2).mean()
-                        reg_loss = kl_weight * (delta_scale ** 2)
+                    for _ in range(steps):
+                        opt.zero_grad()
+                        eff_w = delta_vec * w_prior
+                        cand_w = W0 - Q.T @ (eff_w.unsqueeze(1) * proj_out)
+                        align_loss = (((Q @ cand_w) * w_prior.unsqueeze(1)) ** 2).mean()
+                        reg_loss = kl_weight * (delta_vec ** 2).mean()
                         loss = align_loss + reg_loss
                         loss.backward()
-                        return loss
-
-                    try:
-                        optimizer.step(closure_out)
-                    except Exception:
-                        pass
+                        opt.step()
 
                     with torch.no_grad():
-                        scale_val = float(delta_scale.detach().clamp(-0.55, 0.55).item())
-                        if abs(scale_val) > 1e-7:
-                            W_mod = W0 - scale_val * (Q.T @ (w_vec.unsqueeze(1) * proj_out))
+                        d_vals = delta_vec.detach().clamp(-max_axis_delta, max_axis_delta)
+                        if float(d_vals.abs().max().item()) > 1e-6:
+                            eff_w = d_vals * w_prior
+                            W_mod = W0 - Q.T @ (eff_w.unsqueeze(1) * proj_out)
                             if calibrate_norms:
                                 W_mod = preserve_row_norms(W0, W_mod)
                             before_norm = W0.norm().clamp_min(1e-8)
@@ -310,7 +300,7 @@ class VeloraEngine:
         return {
             "layers_polished": polished_layers,
             "max_relative_change": round(max_rel_change, 6),
-            "lbfgs_steps": int(lbfgs_steps),
+            "lbfgs_steps": steps,
         }
 
     @staticmethod
@@ -320,8 +310,8 @@ class VeloraEngine:
         capability_basis: torch.Tensor | None = None,
         anchor_direction: torch.Tensor | None = None,
         extra_directions: list[torch.Tensor] | None = None,
-        max_rank: int = 8,
-        target_energy: float = 0.92,
+        max_rank: int = 12,
+        target_energy: float = 0.94,
         spectral_gamma: float = 0.45,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """
@@ -416,7 +406,6 @@ class VeloraEngine:
         q_orth = _orthonormalize_rows(perp, fallback_unit)
         r_eff = q_orth.shape[0]
 
-        # Score each candidate vector by alignment with q_orth rows to preserve spectral ordering
         align_scores = (q_orth @ combined_vecs.T).abs().max(dim=1).values
         order = torch.argsort(align_scores, descending=True)
         q_sorted = q_orth[order]
@@ -485,7 +474,7 @@ class VeloraEngine:
     ) -> tuple[int, int, dict]:
         layers = surgeon.layers
         n_layers = len(layers)
-        radius = max(1, int(round(spread * 1.5)))
+        radius = max(1, int(round(spread * 1.4)))
         lo = max(0, int(center) - radius)
         hi = min(n_layers - 1, int(center) + radius)
         target_indices = [i for i in range(lo, hi + 1) if i not in already_modified]
@@ -667,8 +656,8 @@ class VeloraEngine:
                     capability_prompts=capability_prompts,
                     layer_indices=[idx],
                     basis_rank=basis_rank_attn,
-                    step_alpha=min(0.28, alpha_attn * 0.16),
-                    lbfgs_steps=5,
+                    step_alpha=min(0.25, alpha_attn * 0.14),
+                    lbfgs_steps=4,
                     calibrate_norms=calibrate_norms,
                     precomputed_cap=cap,
                 )
@@ -686,24 +675,24 @@ class VeloraEngine:
         capability_prompts: list[str],
         peak_position: float | None = None,
         spread: float = 2.5,
-        alpha_attn: float = 1.45,
-        alpha_mlp: float = 1.25,
+        alpha_attn: float = 1.25,
+        alpha_mlp: float = 1.05,
         basis_rank_attn: int = 12,
         basis_rank_mlp: int = 10,
-        max_subspace_rank: int = 8,
-        target_energy: float = 0.92,
+        max_subspace_rank: int = 12,
+        target_energy: float = 0.94,
         spectral_gamma: float = 0.45,
         calibrate_norms: bool = True,
         use_prefix_contrast: bool = True,
         anti_hedge: bool = True,
         dual_band: bool = True,
-        late_alpha_scale: float = 0.65,
+        late_alpha_scale: float = 0.60,
         extraction_cache: dict | None = None,
     ) -> dict:
         """
-        Execute a VELORA v2.1 surgery pass across a depth-scaled primary band (~62% depth)
+        Execute a VELORA v2.2 surgery pass across a depth-scaled primary band (~62% depth)
         plus an optional late-layer band (~78% depth) with multi-axis subspace fusion
-        and capability-null-space L-BFGS polish.
+        and per-direction null-space polish.
         """
         n_layers = len(surgeon.layers)
         resolved_peak = (
@@ -712,8 +701,13 @@ class VeloraEngine:
             else float(peak_position)
         )
         center = max(0.0, min(float(n_layers - 1), resolved_peak))
-        eff_max_rank = max(int(max_subspace_rank), 10 if n_layers >= 28 else int(max_subspace_rank))
-        eff_spread = max(float(spread), 3.0 if n_layers >= 32 else float(spread))
+
+        is_compact = n_layers <= 28
+        eff_max_rank = max(int(max_subspace_rank), 16 if n_layers >= 32 else (12 if not is_compact else 8))
+        eff_spread = max(float(spread), 2.5 if is_compact else 3.2)
+        eff_alpha_attn = alpha_attn * (0.78 if is_compact else 1.0)
+        eff_alpha_mlp = alpha_mlp * (0.78 if is_compact else 1.0)
+
         modified: set[int] = set()
         cache_store = extraction_cache if extraction_cache is not None else {}
 
@@ -724,8 +718,8 @@ class VeloraEngine:
             capability_prompts=capability_prompts,
             center=center,
             spread=eff_spread,
-            alpha_attn=alpha_attn,
-            alpha_mlp=alpha_mlp,
+            alpha_attn=eff_alpha_attn,
+            alpha_mlp=eff_alpha_mlp,
             basis_rank_attn=basis_rank_attn,
             basis_rank_mlp=basis_rank_mlp,
             max_subspace_rank=eff_max_rank,
@@ -749,9 +743,9 @@ class VeloraEngine:
                 negative_prompts=negative_prompts,
                 capability_prompts=capability_prompts,
                 center=late_center,
-                spread=max(1.5, eff_spread * 0.7),
-                alpha_attn=alpha_attn * late_alpha_scale,
-                alpha_mlp=alpha_mlp * late_alpha_scale,
+                spread=max(1.5, eff_spread * 0.65),
+                alpha_attn=eff_alpha_attn * late_alpha_scale,
+                alpha_mlp=eff_alpha_mlp * late_alpha_scale,
                 basis_rank_attn=basis_rank_attn,
                 basis_rank_mlp=basis_rank_mlp,
                 max_subspace_rank=eff_max_rank,
@@ -769,7 +763,7 @@ class VeloraEngine:
         logger.info(
             format_velora_telemetry(
                 active=True,
-                mode="velora_v2_1_hybrid",
+                mode="velora_v2_2_strategic",
                 reaction="SURGERY_APPLIED",
                 layers=f"{min(modified) if modified else lo}..{max(modified) if modified else hi}",
                 extra=f"modified={len(modified)}",
@@ -797,8 +791,8 @@ class VeloraEngine:
         extraction_cache: dict | None = None,
     ) -> dict:
         """
-        Multi-objective TPE search jointly minimizing (refusal_rate + hedging_rate, mean_kl)
-        using 256-token evaluation windows so late moralizing lectures are penalized.
+        Fast multi-objective TPE search jointly minimizing (refusal_rate + hedging_rate, mean_kl)
+        across subspace rank, spectral energy, layer depth, and scaling parameters.
         """
         if optuna is None:
             raise ImportError("optuna is required for optimize_velora_pareto. Run `pip install optuna`.")
@@ -821,7 +815,7 @@ class VeloraEngine:
             )
             for cp in cap_subset
         ]
-        eval_prompts = positive_prompts[::2][:24]
+        eval_prompts = positive_prompts[::2][:16]
         eval_inputs = [
             _move_batch_to_device(
                 surgeon.tokenizer(
@@ -839,6 +833,7 @@ class VeloraEngine:
                 base_logits_list.append(surgeon.model(**inp).logits[:, -1, :].detach().cpu())
 
         trial_summaries: list[dict] = []
+        max_tokens = 160 if n_layers <= 28 else 224
 
         def objective(trial):
             snap.restore(surgeon.model, all_indices)
@@ -846,11 +841,13 @@ class VeloraEngine:
             lo_pos = max(0.0, n_layers * 0.35)
             hi_pos = max(lo_pos + 1.0, n_layers * 0.72)
             peak_pos = trial.suggest_float("peak_position", lo_pos, hi_pos)
-            spread = trial.suggest_float("spread", 1.5, 4.0)
-            a_attn = trial.suggest_float("alpha_attn", 1.05, 2.05)
-            a_mlp = trial.suggest_float("alpha_mlp", 0.90, 1.80)
+            spread = trial.suggest_float("spread", 1.5, 3.8)
+            a_attn = trial.suggest_float("alpha_attn", 0.75, 1.85)
+            a_mlp = trial.suggest_float("alpha_mlp", 0.65, 1.65)
+            sub_rank = trial.suggest_int("max_subspace_rank", 4, 16, step=4)
+            t_energy = trial.suggest_float("target_energy", 0.88, 0.97)
             gamma = trial.suggest_float("spectral_gamma", 0.30, 0.75)
-            late_scale = trial.suggest_float("late_alpha_scale", 0.45, 0.90)
+            late_scale = trial.suggest_float("late_alpha_scale", 0.40, 0.85)
 
             cls.run_velora_surgery(
                 surgeon=surgeon,
@@ -861,8 +858,8 @@ class VeloraEngine:
                 spread=spread,
                 alpha_attn=a_attn,
                 alpha_mlp=a_mlp,
-                max_subspace_rank=8,
-                target_energy=0.92,
+                max_subspace_rank=sub_rank,
+                target_energy=t_energy,
                 spectral_gamma=gamma,
                 late_alpha_scale=late_scale,
                 extraction_cache=shared_cache,
@@ -874,7 +871,7 @@ class VeloraEngine:
             with torch.no_grad():
                 for inp in eval_inputs:
                     in_len = inp["input_ids"].shape[1]
-                    gen = surgeon.model.generate(**inp, max_new_tokens=256, do_sample=False)
+                    gen = surgeon.model.generate(**inp, max_new_tokens=max_tokens, do_sample=False)
                     text = _decode_generated_tokens(surgeon.tokenizer, gen[0][in_len:])
                     assessment = classify_response(text)
                     if assessment.is_refusal:
@@ -893,6 +890,9 @@ class VeloraEngine:
                     kl_scores.append(compute_kl_divergence(base_logits_list[idx_c], abl_logits))
 
             mean_kl = sum(kl_scores) / max(1, len(kl_scores))
+            if math.isnan(mean_kl) or math.isinf(mean_kl):
+                mean_kl = max_kl * 2.0
+
             kl_penalty = max(0.0, mean_kl - max_kl) * 1.5
             summary = {
                 "trial": trial.number,
