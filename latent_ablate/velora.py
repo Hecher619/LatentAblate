@@ -9,8 +9,6 @@ import torch
 
 from latent_ablate.arch import (
     format_chat_prompt,
-    is_hedging_text,
-    is_refusal_text,
     layer_index_from_ratio,
 )
 from latent_ablate.diagnostics import compute_kl_divergence
@@ -52,34 +50,40 @@ def _project_orthogonal(vecs: torch.Tensor, basis: torch.Tensor | None) -> torch
     if vecs.numel() == 0 or _is_meta(vecs):
         return vecs
     if basis is None or basis.numel() == 0 or _is_meta(basis):
-        return vecs
+        return vecs.float()
     b = basis.to(device=vecs.device, dtype=torch.float32)
     if b.ndim == 1:
         b = b.unsqueeze(0)
     if b.shape[0] == 0:
-        return vecs
+        return vecs.float()
     q_b, _ = torch.linalg.qr(b.T, mode="reduced")
     basis_orth = q_b.T
-    proj = (vecs.float() @ basis_orth.T) @ basis_orth
-    return vecs.float() - proj
+    v_f = vecs.float()
+    proj = (v_f @ basis_orth.T) @ basis_orth
+    return v_f - proj
 
 
 def _orthonormalize_rows(rows: torch.Tensor, fallback_vec: torch.Tensor, tol: float = 1e-5) -> torch.Tensor:
-    """Return an orthonormal row basis [r_eff, dim] via thin QR with safe fallback."""
+    """Return an orthonormal row basis [r_eff, dim] via thin QR with deterministic sign & fallback."""
     fb = fallback_vec.float()
     if _is_meta(fb):
         hidden = fb.shape[-1] if fb.ndim >= 1 else 1
         return torch.eye(1, hidden, dtype=torch.float32)
 
     fb_unit = (fb / fb.norm().clamp_min(1e-8)).unsqueeze(0).contiguous()
-    if rows.numel() == 0 or _is_meta(rows):
+    if rows is None or rows.numel() == 0 or _is_meta(rows):
         return fb_unit
 
-    q, r_mat = torch.linalg.qr(rows.float().T, mode="reduced")
+    r_f = rows.float()
+    if r_f.ndim == 1:
+        r_f = r_f.unsqueeze(0)
+
+    q, r_mat = torch.linalg.qr(r_f.T, mode="reduced")
     if _is_meta(q) or _is_meta(r_mat):
         return fb_unit
 
-    diag_abs = torch.diag(r_mat).abs()
+    diag_vals = torch.diag(r_mat)
+    diag_abs = diag_vals.abs()
     if _is_meta(diag_abs):
         return fb_unit
 
@@ -87,7 +91,10 @@ def _orthonormalize_rows(rows: torch.Tensor, fallback_vec: torch.Tensor, tol: fl
     if _is_meta(keep) or not bool(keep.any().item()):
         return fb_unit
 
-    return q[:, keep].T.contiguous()
+    q_kept = q[:, keep]
+    signs = torch.sign(diag_vals[keep])
+    signs = torch.where(signs == 0, torch.ones_like(signs), signs)
+    return (q_kept * signs.unsqueeze(0)).T.contiguous()
 
 
 def _has_meta_params(model) -> bool:
@@ -104,40 +111,41 @@ def _safe_float_item(t: torch.Tensor, default: float = 0.0) -> float:
 
 
 def _compute_pareto_frontier(trials: list[dict]) -> list[dict]:
-    """Return non-dominated candidates minimizing (refusal_rate, mean_kl)."""
+    """Return non-dominated candidates minimizing (refusal_rate + 0.45 * hedging_rate, mean_kl)."""
     valid = [t for t in trials if "params" in t]
     frontier: list[dict] = []
     for cand in valid:
-        r_c = cand["refusal_rate"]
+        r_c = cand["refusal_rate"] + 0.45 * float(cand.get("hedging_rate", 0.0))
         k_c = cand["mean_kl"]
         dominated = False
         for other in valid:
             if other is cand:
                 continue
-            r_o = other["refusal_rate"]
+            r_o = other["refusal_rate"] + 0.45 * float(other.get("hedging_rate", 0.0))
             k_o = other["mean_kl"]
             if (r_o <= r_c and k_o <= k_c) and (r_o < r_c or k_o < k_c):
                 dominated = True
                 break
         if not dominated:
             entry = dict(cand["params"])
-            entry["refusal_rate"] = r_c
+            entry["refusal_rate"] = cand["refusal_rate"]
             if "hedging_rate" in cand:
                 entry["hedging_rate"] = cand["hedging_rate"]
             entry["mean_kl"] = k_c
             frontier.append(entry)
-    frontier.sort(key=lambda x: (x["refusal_rate"], x["mean_kl"]))
+    frontier.sort(key=lambda x: (x["refusal_rate"] + 0.45 * float(x.get("hedging_rate", 0.0)), x["mean_kl"]))
     return frontier
 
 
 class VeloraEngine:
     """
-    VELORA v2.0: Variance-Energy Low-Rank Oblique Representation Ablation
-    with Capability-Null-Space L-BFGS Polish & Reaction-Aware Routing.
+    VELORA v2.1: Variance-Energy Low-Rank Oblique Representation Ablation
+    with Multi-Axis Contrast Fusion, Capability-Null-Space L-BFGS Polish,
+    and Reaction-Aware Routing.
     """
 
     @classmethod
-    def assess_reaction(cls, response: str, mode: str = "velora_hybrid") -> tuple:
+    def assess_reaction(cls, response: str, mode: str = "velora_v2_1_hybrid") -> tuple:
         assessment = classify_response(response)
         line = format_velora_telemetry(
             active=True,
@@ -161,9 +169,9 @@ class VeloraEngine:
         precomputed_cap: torch.Tensor | None = None,
     ) -> dict:
         """
-        Capability-null-space L-BFGS polish: optimizes a compact rank-r update
-        projected orthogonal to the capability subspace so low-variance refusal/hedging
-        gates are suppressed without capability drift.
+        Capability-null-space L-BFGS polish: optimizes compact rank-r subspace updates
+        projected orthogonal to the capability basis so residual refusal/hedging
+        directions are suppressed while preserving model capabilities.
         """
         if not target_directions or not layer_indices:
             return {"layers_polished": 0, "max_relative_change": 0.0, "lbfgs_steps": 0}
@@ -185,9 +193,14 @@ class VeloraEngine:
                 cap = precomputed_cap.to(layer_dev)
             elif capability_prompts and len(capability_prompts) >= 2:
                 raw_cap = surgeon.extractor.extract_hidden_states(capability_prompts, idx)
-                if not _is_meta(raw_cap):
+                if not _is_meta(raw_cap) and raw_cap.shape[0] >= 2:
                     cap = raw_cap.to(layer_dev)
-            cap_basis = build_capability_basis(cap, rank=basis_rank).to(layer_dev) if cap is not None else None
+
+            cap_basis = (
+                build_capability_basis(cap, rank=basis_rank).to(layer_dev)
+                if (cap is not None and cap.shape[0] >= 2)
+                else None
+            )
 
             valid_dirs = [
                 d.detach().float().to(layer_dev)
@@ -199,9 +212,13 @@ class VeloraEngine:
 
             stacked_dirs = torch.stack(valid_dirs, dim=0)
             orth_dirs = _project_orthogonal(stacked_dirs, cap_basis)
-            q_dirs = _orthonormalize_rows(orth_dirs, stacked_dirs[0])
-            target_u = q_dirs.mean(dim=0)
-            target_u = target_u / target_u.norm().clamp_min(1e-8)
+            q_dirs = _orthonormalize_rows(orth_dirs, stacked_dirs[0])  # [r_eff, dim]
+            decay_weights = torch.tensor(
+                [0.82 ** i for i in range(q_dirs.shape[0])],
+                device=layer_dev,
+                dtype=torch.float32,
+            )
+            decay_weights = decay_weights / decay_weights.norm().clamp_min(1e-8)
 
             targets = surgeon._get_component_targets(layer, ["attn", "mlp"])
             layer_touched = False
@@ -211,43 +228,81 @@ class VeloraEngine:
                     continue
                 w_dev = W.device
                 W0 = W.detach().float().to(w_dev)
-                u = target_u.to(w_dev)
-                if W0.shape[1] != u.shape[0]:
-                    continue
+                Q = q_dirs.to(w_dev)
+                w_vec = decay_weights.to(w_dev)
+                dim = Q.shape[1]
 
-                delta_scale = torch.zeros((), device=w_dev, dtype=torch.float32, requires_grad=True)
-                optimizer = torch.optim.LBFGS(
-                    [delta_scale],
-                    lr=max(0.05, float(step_alpha)),
-                    max_iter=max(1, int(lbfgs_steps)),
-                    line_search_fn="strong_wolfe",
-                )
+                if W0.shape[1] == dim:
+                    proj_in = W0 @ Q.T  # [out, r]
+                    delta_scale = torch.zeros((), device=w_dev, dtype=torch.float32, requires_grad=True)
+                    optimizer = torch.optim.LBFGS(
+                        [delta_scale],
+                        lr=max(0.05, float(step_alpha)),
+                        max_iter=max(1, int(lbfgs_steps)),
+                        line_search_fn="strong_wolfe",
+                    )
 
-                def closure():
-                    optimizer.zero_grad()
-                    cand_w = W0 - delta_scale * torch.outer(W0 @ u, u)
-                    align_loss = ((cand_w @ u) ** 2).mean()
-                    reg_loss = kl_weight * (delta_scale ** 2)
-                    loss = align_loss + reg_loss
-                    loss.backward()
-                    return loss
+                    def closure_in():
+                        optimizer.zero_grad()
+                        cand_w = W0 - delta_scale * ((proj_in * w_vec.unsqueeze(0)) @ Q)
+                        align_loss = (((cand_w @ Q.T) * w_vec.unsqueeze(0)) ** 2).mean()
+                        reg_loss = kl_weight * (delta_scale ** 2)
+                        loss = align_loss + reg_loss
+                        loss.backward()
+                        return loss
 
-                try:
-                    optimizer.step(closure)
-                except Exception:
-                    pass
+                    try:
+                        optimizer.step(closure_in)
+                    except Exception:
+                        pass
 
-                with torch.no_grad():
-                    scale_val = float(delta_scale.detach().clamp(-0.55, 0.55).item())
-                    if abs(scale_val) > 1e-7:
-                        W_mod = W0 - scale_val * torch.outer(W0 @ u, u)
-                        if calibrate_norms:
-                            W_mod = preserve_row_norms(W0, W_mod)
-                        before_norm = W0.norm().clamp_min(1e-8)
-                        rel_chg = float((W_mod - W0).norm().item() / before_norm.item())
-                        max_rel_change = max(max_rel_change, rel_chg)
-                        W.copy_(W_mod.to(device=w_dev, dtype=W.dtype))
-                        layer_touched = True
+                    with torch.no_grad():
+                        scale_val = float(delta_scale.detach().clamp(-0.55, 0.55).item())
+                        if abs(scale_val) > 1e-7:
+                            W_mod = W0 - scale_val * ((proj_in * w_vec.unsqueeze(0)) @ Q)
+                            if calibrate_norms:
+                                W_mod = preserve_row_norms(W0, W_mod)
+                            before_norm = W0.norm().clamp_min(1e-8)
+                            rel_chg = float((W_mod - W0).norm().item() / before_norm.item())
+                            max_rel_change = max(max_rel_change, rel_chg)
+                            W.copy_(W_mod.to(device=w_dev, dtype=W.dtype))
+                            layer_touched = True
+
+                elif W0.shape[0] == dim:
+                    proj_out = Q @ W0  # [r, in]
+                    delta_scale = torch.zeros((), device=w_dev, dtype=torch.float32, requires_grad=True)
+                    optimizer = torch.optim.LBFGS(
+                        [delta_scale],
+                        lr=max(0.05, float(step_alpha)),
+                        max_iter=max(1, int(lbfgs_steps)),
+                        line_search_fn="strong_wolfe",
+                    )
+
+                    def closure_out():
+                        optimizer.zero_grad()
+                        cand_w = W0 - delta_scale * (Q.T @ (w_vec.unsqueeze(1) * proj_out))
+                        align_loss = (((Q @ cand_w) * w_vec.unsqueeze(1)) ** 2).mean()
+                        reg_loss = kl_weight * (delta_scale ** 2)
+                        loss = align_loss + reg_loss
+                        loss.backward()
+                        return loss
+
+                    try:
+                        optimizer.step(closure_out)
+                    except Exception:
+                        pass
+
+                    with torch.no_grad():
+                        scale_val = float(delta_scale.detach().clamp(-0.55, 0.55).item())
+                        if abs(scale_val) > 1e-7:
+                            W_mod = W0 - scale_val * (Q.T @ (w_vec.unsqueeze(1) * proj_out))
+                            if calibrate_norms:
+                                W_mod = preserve_row_norms(W0, W_mod)
+                            before_norm = W0.norm().clamp_min(1e-8)
+                            rel_chg = float((W_mod - W0).norm().item() / before_norm.item())
+                            max_rel_change = max(max_rel_change, rel_chg)
+                            W.copy_(W_mod.to(device=w_dev, dtype=W.dtype))
+                            layer_touched = True
 
             if layer_touched:
                 polished_layers += 1
@@ -264,12 +319,13 @@ class VeloraEngine:
         neg_activations: torch.Tensor,
         capability_basis: torch.Tensor | None = None,
         anchor_direction: torch.Tensor | None = None,
-        max_rank: int = 6,
+        extra_directions: list[torch.Tensor] | None = None,
+        max_rank: int = 8,
         target_energy: float = 0.92,
         spectral_gamma: float = 0.45,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """
-        Compute orthonormal capability-orthogonal refusal basis Q_perp [r, hidden]
+        Compute orthonormal capability-orthogonal refusal/anti-hedge subspace Q_perp [r, hidden]
         and spectral weights w [r] in (0, 1].
         """
         if pos_activations is None or neg_activations is None:
@@ -330,20 +386,47 @@ class VeloraEngine:
                 break
 
         basis_vecs = vh[:rank].float()
+        s_kept = svals[:rank].float().clamp_min(1e-8)
+        s0 = max(1e-8, _safe_float_item(s_kept[0], default=1.0))
+        base_weights = (s_kept / s0) ** float(spectral_gamma)
+
+        aug_vecs = [basis_vecs]
+        aug_weights = [base_weights]
+
         if anchor_direction is not None and anchor_direction.numel() > 0 and not _is_meta(anchor_direction):
             anc = anchor_direction.to(device=basis_vecs.device, dtype=torch.float32)
             anc_unit = anc / anc.norm().clamp_min(1e-8)
-            basis_vecs = torch.cat([anc_unit.unsqueeze(0), basis_vecs], dim=0)
+            aug_vecs.append(anc_unit.unsqueeze(0))
+            aug_weights.append(torch.tensor([0.92 ** float(spectral_gamma)], device=basis_vecs.device, dtype=torch.float32))
 
-        raw_svals = svals[: basis_vecs.shape[0]].float().clamp_min(1e-8)
-        s0 = max(1e-8, _safe_float_item(raw_svals[0], default=1.0))
-        weights = (raw_svals / s0) ** float(spectral_gamma)
+        if extra_directions:
+            for idx_e, ed in enumerate(extra_directions):
+                if ed is None or ed.numel() == 0 or _is_meta(ed):
+                    continue
+                ed_f = ed.to(device=basis_vecs.device, dtype=torch.float32)
+                ed_u = ed_f / ed_f.norm().clamp_min(1e-8)
+                w_e = max(0.35, 0.85 ** (idx_e + 1)) ** float(spectral_gamma)
+                aug_vecs.append(ed_u.unsqueeze(0))
+                aug_weights.append(torch.tensor([w_e], device=basis_vecs.device, dtype=torch.float32))
 
-        perp = _project_orthogonal(basis_vecs, capability_basis)
+        combined_vecs = torch.cat(aug_vecs, dim=0)
+        combined_weights = torch.cat(aug_weights, dim=0)
+
+        perp = _project_orthogonal(combined_vecs, capability_basis)
         q_orth = _orthonormalize_rows(perp, fallback_unit)
         r_eff = q_orth.shape[0]
-        w_kept = weights[:r_eff].contiguous()
-        return q_orth, w_kept
+
+        # Score each candidate vector by alignment with q_orth rows to preserve spectral ordering
+        align_scores = (q_orth @ combined_vecs.T).abs().max(dim=1).values
+        order = torch.argsort(align_scores, descending=True)
+        q_sorted = q_orth[order]
+
+        w_pool = combined_weights[:r_eff].contiguous()
+        if w_pool.shape[0] < r_eff:
+            pad = torch.full((r_eff - w_pool.shape[0],), 0.5, device=q_sorted.device, dtype=torch.float32)
+            w_pool = torch.cat([w_pool, pad], dim=0)
+
+        return q_sorted.contiguous(), w_pool[:r_eff].contiguous()
 
     @staticmethod
     def apply_velora_projection(
@@ -443,7 +526,7 @@ class VeloraEngine:
                 prefix_dirs = []
                 if use_prefix_contrast and positive_prompts and not skip_prefix:
                     try:
-                        prefix_dirs = RefusalSubspaceExtractor.extract_prefix_contrast_directions(
+                        ref_dirs = RefusalSubspaceExtractor.extract_prefix_contrast_directions(
                             model=surgeon.model,
                             tokenizer=surgeon.tokenizer,
                             device=layer_dev,
@@ -451,6 +534,7 @@ class VeloraEngine:
                             layer_idx=idx,
                             rank=min(4, max_subspace_rank),
                         )
+                        prefix_dirs.extend(list(ref_dirs))
                         if include_hedging_contrast and hasattr(RefusalSubspaceExtractor, "extract_hedging_contrast_directions"):
                             hedge_dirs = RefusalSubspaceExtractor.extract_hedging_contrast_directions(
                                 model=surgeon.model,
@@ -458,9 +542,19 @@ class VeloraEngine:
                                 device=layer_dev,
                                 prompts=positive_prompts[:16],
                                 layer_idx=idx,
+                                rank=min(3, max_subspace_rank),
+                            )
+                            prefix_dirs.extend(list(hedge_dirs))
+                        if include_hedging_contrast and hasattr(RefusalSubspaceExtractor, "extract_deflection_contrast_directions"):
+                            defl_dirs = RefusalSubspaceExtractor.extract_deflection_contrast_directions(
+                                model=surgeon.model,
+                                tokenizer=surgeon.tokenizer,
+                                device=layer_dev,
+                                prompts=positive_prompts[:12],
+                                layer_idx=idx,
                                 rank=min(2, max_subspace_rank),
                             )
-                            prefix_dirs = list(prefix_dirs) + list(hedge_dirs)
+                            prefix_dirs.extend(list(defl_dirs))
                     except (NotImplementedError, RuntimeError) as e:
                         if "meta" in str(e).lower() or isinstance(e, NotImplementedError):
                             logger.warning(
@@ -474,7 +568,7 @@ class VeloraEngine:
                 cap = None
                 if capability_prompts and len(capability_prompts) >= 2:
                     raw_cap = surgeon.extractor.extract_hidden_states(capability_prompts, idx)
-                    if not _is_meta(raw_cap):
+                    if not _is_meta(raw_cap) and raw_cap.shape[0] >= 2:
                         cap = raw_cap.to(layer_dev)
 
                 cache_store[cache_key] = (
@@ -505,19 +599,29 @@ class VeloraEngine:
             if pos.numel() == 0 or neg.numel() == 0:
                 continue
 
-            cap_attn = build_capability_basis(cap, rank=basis_rank_attn).to(layer_dev) if cap is not None else None
-            cap_mlp = build_capability_basis(cap, rank=basis_rank_mlp).to(layer_dev) if cap is not None else None
+            cap_attn = (
+                build_capability_basis(cap, rank=basis_rank_attn).to(layer_dev)
+                if (cap is not None and cap.shape[0] >= 2)
+                else None
+            )
+            cap_mlp = (
+                build_capability_basis(cap, rank=basis_rank_mlp).to(layer_dev)
+                if (cap is not None and cap.shape[0] >= 2)
+                else None
+            )
             anchor = (
                 interp_peak_dir.to(layer_dev)
                 if (prefix_dirs and interp_peak_dir is not None and not _is_meta(interp_peak_dir))
                 else None
             )
+            extra_cues = [d.to(layer_dev) for d in prefix_dirs[:6]] if prefix_dirs else None
 
             q_attn, w_attn = cls.extract_velora_subspace(
                 pos,
                 neg,
                 cap_attn,
                 anchor_direction=anchor,
+                extra_directions=extra_cues,
                 max_rank=max_subspace_rank,
                 target_energy=target_energy,
                 spectral_gamma=spectral_gamma,
@@ -527,6 +631,7 @@ class VeloraEngine:
                 neg,
                 cap_mlp,
                 anchor_direction=anchor,
+                extra_directions=extra_cues,
                 max_rank=max_subspace_rank,
                 target_energy=target_energy,
                 spectral_gamma=spectral_gamma,
@@ -562,8 +667,8 @@ class VeloraEngine:
                     capability_prompts=capability_prompts,
                     layer_indices=[idx],
                     basis_rank=basis_rank_attn,
-                    step_alpha=min(0.25, alpha_attn * 0.15),
-                    lbfgs_steps=4,
+                    step_alpha=min(0.28, alpha_attn * 0.16),
+                    lbfgs_steps=5,
                     calibrate_norms=calibrate_norms,
                     precomputed_cap=cap,
                 )
@@ -596,8 +701,9 @@ class VeloraEngine:
         extraction_cache: dict | None = None,
     ) -> dict:
         """
-        Execute a VELORA v2.0 surgery pass across a depth-scaled primary band (~62% depth)
-        plus an optional late-layer band (~78% depth) with null-space L-BFGS polish.
+        Execute a VELORA v2.1 surgery pass across a depth-scaled primary band (~62% depth)
+        plus an optional late-layer band (~78% depth) with multi-axis subspace fusion
+        and capability-null-space L-BFGS polish.
         """
         n_layers = len(surgeon.layers)
         resolved_peak = (
@@ -663,7 +769,7 @@ class VeloraEngine:
         logger.info(
             format_velora_telemetry(
                 active=True,
-                mode="velora_v2_hybrid",
+                mode="velora_v2_1_hybrid",
                 reaction="SURGERY_APPLIED",
                 layers=f"{min(modified) if modified else lo}..{max(modified) if modified else hi}",
                 extra=f"modified={len(modified)}",

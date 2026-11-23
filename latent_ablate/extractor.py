@@ -15,6 +15,7 @@ def _to_device_batch(batch, device):
         return {k: (v.to(device) if hasattr(v, "to") else v) for k, v in batch.items()}
     return batch
 
+
 logger = logging.getLogger("LatentAblate.Extractor")
 
 
@@ -92,7 +93,13 @@ class ActivationExtractor:
         logger.info(f"Auto-selected activation batch size: {best}")
         return best
 
-    def _run_chunk_with_oom_retry(self, chunk_formatted: list[str], target_layer, initial_bs: int) -> list[torch.Tensor]:
+    def _run_chunk_with_oom_retry(
+        self,
+        chunk_formatted: list[str],
+        target_layer,
+        initial_bs: int,
+        pad_side: str = "left",
+    ) -> list[torch.Tensor]:
         """Run a chunk in mini-batches, halving batch size automatically if CUDA OOM occurs."""
         results: list[torch.Tensor] = []
         idx = 0
@@ -115,23 +122,18 @@ class ActivationExtractor:
                     truncation=True,
                     max_length=self.max_length,
                 )
-                enc = (
-                    raw_enc.to(self.device)
-                    if hasattr(raw_enc, "to")
-                    else {k: v.to(self.device) if hasattr(v, "to") else v for k, v in raw_enc.items()}
-                )
-                enc = _to_device_batch(enc, self.device)
+                enc = _to_device_batch(raw_enc, self.device)
                 with torch.no_grad():
                     self.model(**enc)
 
                 if captured:
                     batch_hidden = captured[-1]  # [B, T, H]
-                    attn_mask = enc.get("attention_mask")
+                    attn_mask = enc.get("attention_mask") if isinstance(enc, dict) else getattr(enc, "attention_mask", None)
                     if attn_mask is not None and attn_mask.numel() > 0:
                         batch_size_cur = batch_hidden.shape[0]
                         seq_len_cur = batch_hidden.shape[1]
                         row_indices = torch.arange(batch_size_cur, device=batch_hidden.device)
-                        if getattr(self.tokenizer, "padding_side", "left") == "left":
+                        if pad_side == "left":
                             last_idx = torch.full(
                                 (batch_size_cur,),
                                 max(0, seq_len_cur - 1),
@@ -216,7 +218,9 @@ class ActivationExtractor:
                 for pos_start in range(0, len(sorted_missing), bs):
                     batch_orig_indices = sorted_missing[pos_start : pos_start + bs]
                     batch_texts = [formatted_all[orig_i] for orig_i in batch_orig_indices]
-                    chunk_vecs_list = self._run_chunk_with_oom_retry(batch_texts, target_layer, bs)
+                    chunk_vecs_list = self._run_chunk_with_oom_retry(
+                        batch_texts, target_layer, bs, pad_side="left"
+                    )
                     if chunk_vecs_list:
                         stacked = torch.cat(chunk_vecs_list, dim=0)
                         for row_offset, orig_i in enumerate(batch_orig_indices):

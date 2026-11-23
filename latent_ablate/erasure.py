@@ -2,7 +2,6 @@ import logging
 import torch
 
 logger = logging.getLogger("LatentAblate.Erasure")
-
 ORTHO_FALLBACK = 1e-6
 
 
@@ -256,7 +255,7 @@ def project_out_subspace(
         return W_f32
 
     q, _ = torch.linalg.qr(B.T, mode="reduced")
-    Q = q.T  # [r_eff, dim]
+    Q = q.T
     dim = Q.shape[1]
     scale = float(alpha)
     out_features, in_features = W_f32.shape

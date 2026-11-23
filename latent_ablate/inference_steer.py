@@ -1,17 +1,25 @@
-import torch
 import logging
 import math
+import torch
 
 logger = logging.getLogger("LatentAblate.InferenceSteer")
 
+
 class DynamicSteeringManager:
-    def __init__(self, model, tokenizer, device):
+    def __init__(self, model, tokenizer, device, seed: int = 42):
         self.model = model
         self.tokenizer = tokenizer
         self.device = device
+        self.seed = int(seed)
         self.active_handles = []
 
-    def register_steering_hook(self, layer, r_refusal: torch.Tensor, v_target: torch.Tensor, theta_deg: float = -30.0):
+    def register_steering_hook(
+        self,
+        layer,
+        r_refusal: torch.Tensor,
+        v_target: torch.Tensor,
+        theta_deg: float = -30.0,
+    ):
         """Applies runtime angular steering hook without modifying permanent weights."""
         r = torch.nn.functional.normalize(r_refusal.float().to(self.device), dim=0)
         v = v_target.float().to(self.device)
@@ -19,10 +27,11 @@ class DynamicSteeringManager:
         if v.norm() > 1e-6:
             v = torch.nn.functional.normalize(v, dim=0)
         else:
-            v = torch.randn_like(r)
-            v = torch.nn.functional.normalize(v - torch.dot(v, r) * r, dim=0)
+            gen = torch.Generator(device="cpu").manual_seed(self.seed)
+            fallback = torch.randn(r.shape, generator=gen, dtype=torch.float32).to(self.device)
+            v = torch.nn.functional.normalize(fallback - torch.dot(fallback, r) * r, dim=0)
 
-        theta = math.radians(theta_deg)
+        theta = math.radians(float(theta_deg))
         cos_t, sin_t = math.cos(theta), math.sin(theta)
 
         def steering_hook(module, input, output):

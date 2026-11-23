@@ -247,7 +247,7 @@ def interpolate_layer_direction(layer_vectors: dict, position: float):
 
     frac = float(position - lo) / float(hi - lo)
     v_lo = layer_vectors[lo].float()
-    v_hi = layer_vectors[hi].float()
+    v_hi = layer_vectors[hi].float().to(v_lo.device)
     blended = (1.0 - frac) * v_lo + frac * v_hi
     norm = blended.norm()
     if norm > 1e-8:

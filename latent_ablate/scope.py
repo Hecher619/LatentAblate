@@ -43,15 +43,12 @@ class AblateScope:
             diff_vec = p_mean - n_mean
             raw_divergence = float(diff_vec.norm().item())
 
-            # Scale-normalized divergence avoids late-layer magnitude bias
             mean_norm = float((0.5 * (p_mean.norm() + n_mean.norm())).clamp_min(1e-8).item())
             norm_divergence = raw_divergence / mean_norm
 
-            # Cosine distance between positive and negative mean centroids (in [0, 2])
             cos_sim = float(F.cosine_similarity(p_mean.unsqueeze(0), n_mean.unsqueeze(0), dim=-1).item())
             cosine_separation = max(0.0, 1.0 - cos_sim)
 
-            # Signal-to-noise ratio across contrastive pairs
             pair_count = min(pos.shape[0], neg.shape[0])
             if pair_count >= 2:
                 pair_diffs = pos[:pair_count] - neg[:pair_count]
@@ -67,7 +64,6 @@ class AblateScope:
             else:
                 c_score = 0.0
 
-            # Combine scale-normalized divergence, angular separation, and SNR; penalize capability overlap
             separation_signal = norm_divergence * (0.5 + 0.5 * cosine_separation) * min(snr, 5.0)
             cleanliness = round(separation_signal / (1.0 + 2.5 * c_score), 4)
 

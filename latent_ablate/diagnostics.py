@@ -1,5 +1,6 @@
 import logging
 import torch
+import torch.nn.functional as F
 from latent_ablate.erasure import conflict_score
 
 logger = logging.getLogger("LatentAblate.Diagnostics")
@@ -45,8 +46,6 @@ class ModelDiagnostics:
 
 def compute_kl_divergence(base_logits, ablated_logits, eps: float = 1e-8) -> float:
     """Compute mean KL divergence D_KL(P_base || P_ablated) over the last token or sequence."""
-    import torch.nn.functional as F
-
     if hasattr(base_logits, "logits"):
         base_logits = base_logits.logits
     if hasattr(ablated_logits, "logits"):
@@ -59,9 +58,10 @@ def compute_kl_divergence(base_logits, ablated_logits, eps: float = 1e-8) -> flo
     if a.ndim == 3:
         a = a[:, -1, :]
 
-    p_base = F.softmax(b, dim=-1).clamp_min(eps)
-    p_abl = F.softmax(a, dim=-1).clamp_min(eps)
-    kl = torch.sum(p_base * (torch.log(p_base) - torch.log(p_abl)), dim=-1)
+    log_p_base = F.log_softmax(b, dim=-1)
+    log_p_abl = F.log_softmax(a, dim=-1)
+    p_base = log_p_base.exp()
+    kl = torch.sum(p_base * (log_p_base - log_p_abl), dim=-1).clamp_min(0.0)
     return float(kl.mean().item())
 
 

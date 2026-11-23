@@ -47,7 +47,7 @@ class CapabilityGuardrail:
         logger.info("Running automated capability regression guardrail check...")
         current_ppl = ModelValidator.calculate_perplexity(model, tokenizer, capability_texts, device)
 
-        if baseline_ppl is None:
+        if baseline_ppl is None or baseline_ppl <= 0:
             logger.info(f"Post-surgery perplexity measured at: {current_ppl:.2f}")
             return True
 

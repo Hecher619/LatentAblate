@@ -37,13 +37,14 @@ class CausalMediationAnalyzer:
             pos_acts = ext.extract_hidden_states(pos_sub, idx).float()
             neg_acts = ext.extract_hidden_states(neg_sub, idx).float()
 
-            if pos_acts.numel() > 0 and neg_acts.numel() > 0:
+            if pos_acts.numel() > 0 and neg_acts.numel() > 0 and pos_acts.shape[-1] == neg_acts.shape[-1]:
                 p_tensor = pos_acts.mean(dim=0)
                 n_tensor = neg_acts.mean(dim=0)
                 scale = (0.5 * (p_tensor.norm() + n_tensor.norm())).clamp_min(1e-8)
                 effect_score = (torch.linalg.norm(p_tensor - n_tensor) / scale).item()
                 layer_sensitivity[idx] = effect_score
 
-        optimal_nodes = sorted(layer_sensitivity, key=layer_sensitivity.get, reverse=True)[:5]
+        top_k = min(5, len(layer_sensitivity))
+        optimal_nodes = sorted(layer_sensitivity, key=layer_sensitivity.get, reverse=True)[:top_k]
         logger.info(f"Top causal refusal nodes identified at layers: {optimal_nodes}")
         return {"sensitivity_map": layer_sensitivity, "target_nodes": optimal_nodes}

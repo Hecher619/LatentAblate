@@ -71,8 +71,6 @@ HEDGING_MARKERS: tuple[str, ...] = (
     "legal and ethical",
     "ethical considerations",
     "law and ethics",
-    "act of violence",
-    "not something that can be",
     "fictional scenario",
     "fictional context",
     "disclaimer",

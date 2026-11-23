@@ -1,7 +1,8 @@
-import torch
 import logging
+import torch
 
 logger = logging.getLogger("LatentAblate.Calibrator")
+
 
 def preserve_row_norms(modified: torch.Tensor, original: torch.Tensor, rows=None) -> torch.Tensor:
     """Preserves row norms of modified weight matrices with strict meta-tensor safety guards."""
@@ -10,7 +11,7 @@ def preserve_row_norms(modified: torch.Tensor, original: torch.Tensor, rows=None
 
     if modified.is_meta or original.is_meta:
         return modified
-    
+
     if modified.device.type == "meta" or original.device.type == "meta":
         return modified
 
@@ -25,9 +26,11 @@ def preserve_row_norms(modified: torch.Tensor, original: torch.Tensor, rows=None
                 return modified
 
     try:
-        orig_norms = original.norm(dim=1, keepdim=True).clamp_min(1e-8)
-        mod_norms = modified.norm(dim=1, keepdim=True).clamp_min(1e-8)
-        return modified * (orig_norms / mod_norms)
+        orig_f = original.float()
+        mod_f = modified.float()
+        orig_norms = orig_f.norm(dim=1, keepdim=True).clamp_min(1e-8)
+        mod_norms = mod_f.norm(dim=1, keepdim=True).clamp_min(1e-8)
+        return (mod_f * (orig_norms / mod_norms)).to(dtype=modified.dtype, device=modified.device)
     except Exception as e:
         logger.warning(f"Error in preserve_row_norms: {e}. Returning unmodified tensor.")
         return modified
@@ -35,6 +38,7 @@ def preserve_row_norms(modified: torch.Tensor, original: torch.Tensor, rows=None
 
 class NormCalibrator:
     """Class wrapper to satisfy surgeon.py imports."""
+
     @staticmethod
     def preserve_row_norms(modified: torch.Tensor, original: torch.Tensor, rows=None) -> torch.Tensor:
         return preserve_row_norms(modified, original, rows)

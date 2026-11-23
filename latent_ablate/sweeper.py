@@ -70,7 +70,7 @@ class LayerSweeper:
             pos_acts = self.extractor.extract_hidden_states(positive_prompts, idx).float().to(layer_dev)
             neg_acts = self.extractor.extract_hidden_states(negative_prompts, idx).float().to(layer_dev)
 
-            if pos_acts.numel() > 0 and neg_acts.numel() > 0:
+            if pos_acts.numel() > 0 and neg_acts.numel() > 0 and pos_acts.shape[-1] == neg_acts.shape[-1]:
                 p_mean = pos_acts.mean(dim=0)
                 n_mean = neg_acts.mean(dim=0)
                 scale = 0.5 * (p_mean.norm() + n_mean.norm()).clamp_min(1e-8)

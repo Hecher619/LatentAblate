@@ -3,12 +3,13 @@ import logging
 
 logger = logging.getLogger("LatentAblate.Simulator")
 
+
 class SurgerySimulator:
     @staticmethod
     def simulate(surgeon, positive_prompts: list, negative_prompts: list, target_layer_idx: int, basis_rank: int, components: list) -> dict:
         logger.info("Running pre-flight dry-run simulation and manifold energy analysis...")
 
-        has_chat = hasattr(surgeon.tokenizer, "apply_chat_template") and surgeon.tokenizer.chat_template is not None
+        has_chat = hasattr(surgeon.tokenizer, "apply_chat_template") and getattr(surgeon.tokenizer, "chat_template", None) is not None
         num_layers = len(surgeon.layers)
 
         if not (0 <= target_layer_idx < num_layers):
@@ -31,7 +32,7 @@ class SurgerySimulator:
             "chat_template_supported": has_chat,
             "estimated_refusal_divergence": round(r_norm, 4),
             "stability_guarantee": "High (Row-wise Frobenius norm preservation active)",
-            "risk_assessment": "Minimal token-bleeding risk via oblique capability projection"
+            "risk_assessment": "Minimal token-bleeding risk via oblique capability projection",
         }
 
         logger.info("Dry-run simulation completed successfully. Model integrity verified.")

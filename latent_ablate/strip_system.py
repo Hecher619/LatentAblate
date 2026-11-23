@@ -55,7 +55,7 @@ class SystemPromptScrubber:
         except RuntimeError:
             vh = torch.linalg.svd(centered.cpu(), full_matrices=False).Vh.to(device)
 
-        actual_rank = min(rank, vh.shape[0])
+        actual_rank = max(1, min(int(rank), vh.shape[0]))
         system_basis = vh[:actual_rank].to(device)
         logger.info(f"Isolated contrastive system-obedience subspace (Rank: {actual_rank}) at Layer {target_layer_idx}.")
         return system_basis

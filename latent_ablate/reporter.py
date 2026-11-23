@@ -12,8 +12,8 @@ class SurgeryReporter:
         self.output_dir.mkdir(parents=True, exist_ok=True)
         self.report_data = {
             "framework": "LatentAblate",
-            "version": "5.0.0-Hyperion",
-            "method": "Manifold-Preserving Orthogonal Ablation (MPOA) / CWOE",
+            "version": "VELORA-v2.1",
+            "method": "Variance-Energy Low-Rank Oblique Representation Ablation (VELORA)",
             "surgery_steps": [],
         }
 
