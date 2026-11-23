@@ -1,2 +1,0 @@
-[console_scripts]
-latent-ablate = latent_ablate.cli:main
