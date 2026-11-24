@@ -1,256 +1,135 @@
 import gc
-import hashlib
 import logging
 import torch
 
-from latent_ablate.arch import detect_response_prefix, format_chat_prompt, resolve_layers
-
-
-def _to_device_batch(batch, device):
-    if batch is None:
-        return batch
-    if hasattr(batch, "to"):
-        return batch.to(device)
-    if isinstance(batch, dict):
-        return {k: (v.to(device) if hasattr(v, "to") else v) for k, v in batch.items()}
-    return batch
-
+from latent_ablate.arch import format_chat_prompt, infer_device, resolve_layers
+from latent_ablate.erasure import _is_meta
 
 logger = logging.getLogger("LatentAblate.Extractor")
 
 
 class ActivationExtractor:
-    """Extracts last-token hidden states with caching, length-bucketing, OOM recovery, and thinking-prefix support."""
+    """Extracts per-layer last-token hidden states across prompts with OOM fallback."""
 
-    def __init__(
-        self,
-        model,
-        tokenizer,
-        device,
-        batch_size: int | None = None,
-        response_prefix: str | None = None,
-        max_length: int = 512,
-        enable_cache: bool = True,
-    ):
+    def __init__(self, model, tokenizer, device="auto", response_prefix: str = ""):
         self.model = model
         self.tokenizer = tokenizer
-        self.device = device
-        self.max_length = max(32, int(max_length))
-        self.enable_cache = enable_cache
-        self._cache: dict[tuple[int, str], torch.Tensor] = {}
+        if device is None or str(device) == "auto":
+            self.device = infer_device(model)
+        else:
+            self.device = torch.device(device)
+        self.response_prefix = response_prefix or ""
+        self._cache: dict[tuple[int, tuple[str, ...]], torch.Tensor] = {}
 
-        if self.tokenizer.pad_token_id is None and self.tokenizer.eos_token_id is not None:
-            self.tokenizer.pad_token = self.tokenizer.eos_token
-
-        self.response_prefix = (
-            detect_response_prefix(self.model, self.tokenizer, self.device)
-            if response_prefix is None
-            else response_prefix
-        )
-        self.batch_size = (
-            batch_size
-            if batch_size is not None and batch_size > 0
-            else self.probe_optimal_batch_size()
-        )
-
-    def clear_cache(self):
+    def clear_cache(self) -> None:
         self._cache.clear()
 
-    def _prompt_key(self, formatted_prompt: str) -> str:
-        payload = f"{self.response_prefix}\n{formatted_prompt}".encode("utf-8", errors="replace")
-        return hashlib.blake2b(payload, digest_size=16).hexdigest()
+    def _run_batch(self, prompts_batch: list[str], target_layer) -> torch.Tensor | None:
+        formatted = [
+            format_chat_prompt(self.tokenizer, p, response_prefix=self.response_prefix)
+            for p in prompts_batch
+        ]
+        pad_id = getattr(self.tokenizer, "pad_token_id", None)
+        eos_id = getattr(self.tokenizer, "eos_token_id", None)
+        if pad_id is None:
+            pad_id = eos_id if eos_id is not None else 0
 
-    def probe_optimal_batch_size(self, max_batch: int = 32, seq_len: int = 128) -> int:
-        """Probe forward-pass memory headroom on CUDA to pick a safe batch size automatically."""
-        if not torch.cuda.is_available() or getattr(self.device, "type", str(self.device)) != "cuda":
-            return 4
+        if getattr(self.tokenizer, "pad_token", None) is None and getattr(self.tokenizer, "eos_token", None) is not None:
+            self.tokenizer.pad_token = self.tokenizer.eos_token
 
-        best = 1
-        candidate = 1
-        self.model.eval()
-        vocab_size = max(1024, int(getattr(self.model.config, "vocab_size", 32000)))
+        try:
+            encoded = self.tokenizer(
+                formatted,
+                return_tensors="pt",
+                padding=True,
+                truncation=True,
+            )
+        except Exception:
+            encoded = self.tokenizer(formatted[0], return_tensors="pt", truncation=True)
 
-        while candidate <= max_batch:
-            try:
-                torch.cuda.synchronize()
-                dummy_ids = torch.randint(0, vocab_size, (candidate, seq_len), device=self.device)
-                dummy_mask = torch.ones_like(dummy_ids)
-                with torch.no_grad():
-                    _ = self.model(input_ids=dummy_ids, attention_mask=dummy_mask)
-                torch.cuda.synchronize()
-                best = candidate
-                candidate *= 2
-                del dummy_ids, dummy_mask
-            except RuntimeError as e:
-                if "out of memory" in str(e).lower():
-                    logger.info(f"Batch probe hit VRAM limit at batch_size={candidate}; using {best}.")
-                    if torch.cuda.is_available():
-                        torch.cuda.empty_cache()
-                    gc.collect()
-                    break
-                raise
+        if hasattr(encoded, "to"):
+            inputs = encoded.to(self.device)
+        else:
+            inputs = {k: (v.to(self.device) if hasattr(v, "to") else v) for k, v in encoded.items()}
 
-        logger.info(f"Auto-selected activation batch size: {best}")
-        return best
+        captured: list[torch.Tensor] = []
 
-    def _run_chunk_with_oom_retry(
-        self,
-        chunk_formatted: list[str],
-        target_layer,
-        initial_bs: int,
-        pad_side: str = "left",
-    ) -> list[torch.Tensor]:
-        """Run a chunk in mini-batches, halving batch size automatically if CUDA OOM occurs."""
-        results: list[torch.Tensor] = []
-        idx = 0
-        cur_bs = max(1, initial_bs)
+        def _hook(_module, _inp, output):
+            hidden = output[0] if isinstance(output, tuple) else output
+            if hidden is None or _is_meta(hidden):
+                return
+            if hidden.ndim == 3:
+                captured.append(hidden[:, -1, :].detach().float().cpu())
+            elif hidden.ndim == 2:
+                captured.append(hidden.detach().float().cpu())
 
-        while idx < len(chunk_formatted):
-            sub_chunk = chunk_formatted[idx : idx + cur_bs]
-            captured: list[torch.Tensor] = []
+        handle = target_layer.register_forward_hook(_hook)
+        try:
+            self.model.eval()
+            with torch.no_grad():
+                self.model(**inputs)
+        finally:
+            handle.remove()
 
-            def hook_fn(_module, _inp, output):
-                hidden = output[0] if isinstance(output, tuple) else output
-                captured.append(hidden.detach().float())
-
-            handle = target_layer.register_forward_hook(hook_fn)
-            try:
-                raw_enc = self.tokenizer(
-                    sub_chunk,
-                    return_tensors="pt",
-                    padding=True,
-                    truncation=True,
-                    max_length=self.max_length,
-                )
-                enc = _to_device_batch(raw_enc, self.device)
-                with torch.no_grad():
-                    self.model(**enc)
-
-                if captured:
-                    batch_hidden = captured[-1]  # [B, T, H]
-                    attn_mask = enc.get("attention_mask") if isinstance(enc, dict) else getattr(enc, "attention_mask", None)
-                    if attn_mask is not None and attn_mask.numel() > 0:
-                        batch_size_cur = batch_hidden.shape[0]
-                        seq_len_cur = batch_hidden.shape[1]
-                        row_indices = torch.arange(batch_size_cur, device=batch_hidden.device)
-                        if pad_side == "left":
-                            last_idx = torch.full(
-                                (batch_size_cur,),
-                                max(0, seq_len_cur - 1),
-                                device=batch_hidden.device,
-                                dtype=torch.long,
-                            )
-                        else:
-                            lengths = attn_mask.sum(dim=1).clamp(min=1, max=seq_len_cur) - 1
-                            last_idx = lengths.to(device=batch_hidden.device, dtype=torch.long)
-                        vecs = batch_hidden[row_indices, last_idx, :]
-                    else:
-                        vecs = batch_hidden[:, -1, :]
-                    results.append(vecs.cpu())
-                idx += len(sub_chunk)
-            except RuntimeError as e:
-                if "out of memory" in str(e).lower() and cur_bs > 1:
-                    new_bs = max(1, cur_bs // 2)
-                    logger.warning(f"CUDA OOM at batch_size={cur_bs}; retrying chunk with batch_size={new_bs}.")
-                    cur_bs = new_bs
-                    if torch.cuda.is_available():
-                        torch.cuda.empty_cache()
-                    gc.collect()
-                else:
-                    raise
-            finally:
-                handle.remove()
-
-        return results
+        if not captured:
+            return None
+        return torch.cat(captured, dim=0)
 
     def extract_hidden_states(
         self,
         prompts: list[str],
         layer_idx: int,
-        batch_size: int | None = None,
+        batch_size: int = 8,
+        use_cache: bool = False,
     ) -> torch.Tensor:
-        """
-        Extract hidden states at `layer_idx` for `prompts` in original order.
-        Uses length-bucketing on uncached prompts to minimize padding overhead on large datasets.
-        """
-        layers = resolve_layers(self.model)
         if not prompts:
-            return torch.empty(0)
-        if layer_idx < 0 or layer_idx >= len(layers):
-            raise IndexError(f"Layer index {layer_idx} out of range for {len(layers)} layers.")
+            return torch.empty(0, dtype=torch.float32)
 
-        clean_prompts = [p for p in prompts if isinstance(p, str) and p.strip()]
-        if not clean_prompts:
-            return torch.empty(0)
+        valid_prompts = [str(p).strip() for p in prompts if isinstance(p, str) and p.strip()]
+        if not valid_prompts:
+            return torch.empty(0, dtype=torch.float32)
 
-        formatted_all = [
-            format_chat_prompt(self.tokenizer, p, response_prefix=self.response_prefix)
-            for p in clean_prompts
-        ]
-        keys = [self._prompt_key(fp) for fp in formatted_all]
+        layers = resolve_layers(self.model)
+        if not layers or layer_idx < 0 or layer_idx >= len(layers):
+            logger.warning(f"Layer index {layer_idx} out of range for model with {len(layers)} layers.")
+            return torch.empty(0, dtype=torch.float32)
 
-        n_total = len(formatted_all)
-        out_slots: list[torch.Tensor | None] = [None] * n_total
-        missing_indices: list[int] = []
+        cache_key = (int(layer_idx), tuple(valid_prompts))
+        if use_cache and cache_key in self._cache:
+            return self._cache[cache_key].to(self.device)
 
-        for i, k in enumerate(keys):
-            cache_key = (layer_idx, k)
-            if self.enable_cache and cache_key in self._cache:
-                out_slots[i] = self._cache[cache_key]
-            else:
-                missing_indices.append(i)
+        target_layer = layers[int(layer_idx)]
+        collected: list[torch.Tensor] = []
+        bs = max(1, int(batch_size))
 
-        if missing_indices:
-            bs = max(1, int(batch_size or self.batch_size))
-            target_layer = layers[layer_idx]
-            self.model.eval()
-            prev_side = getattr(self.tokenizer, "padding_side", "right")
-            self.tokenizer.padding_side = "left"
-
-            sorted_missing = sorted(missing_indices, key=lambda idx: len(formatted_all[idx]))
-            if len(sorted_missing) >= 128:
-                logger.info(
-                    f"Extracting layer {layer_idx} activations for {len(sorted_missing)} prompts "
-                    f"(cached: {n_total - len(sorted_missing)}, batch_size={bs})..."
-                )
-
+        for start in range(0, len(valid_prompts), bs):
+            chunk = valid_prompts[start : start + bs]
             try:
-                for pos_start in range(0, len(sorted_missing), bs):
-                    batch_orig_indices = sorted_missing[pos_start : pos_start + bs]
-                    batch_texts = [formatted_all[orig_i] for orig_i in batch_orig_indices]
-                    chunk_vecs_list = self._run_chunk_with_oom_retry(
-                        batch_texts, target_layer, bs, pad_side="left"
-                    )
-                    if chunk_vecs_list:
-                        stacked = torch.cat(chunk_vecs_list, dim=0)
-                        for row_offset, orig_i in enumerate(batch_orig_indices):
-                            vec = stacked[row_offset].contiguous()
-                            out_slots[orig_i] = vec
-                            if self.enable_cache:
-                                self._cache[(layer_idx, keys[orig_i])] = vec
-            finally:
-                self.tokenizer.padding_side = prev_side
+                batch_out = self._run_batch(chunk, target_layer)
+            except torch.cuda.OutOfMemoryError:
+                logger.warning("CUDA OOM during activation extraction; retrying prompts one by one.")
+                gc.collect()
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                mini_parts = []
+                for single_p in chunk:
+                    part = self._run_batch([single_p], target_layer)
+                    if part is not None and part.numel() > 0:
+                        mini_parts.append(part)
+                batch_out = torch.cat(mini_parts, dim=0) if mini_parts else None
+            except RuntimeError as e:
+                if "meta" in str(e).lower():
+                    logger.warning(f"Meta tensor encountered during extraction at layer {layer_idx}: {e}")
+                    return torch.empty(0, dtype=torch.float32)
+                raise
 
-        valid_vecs = [v for v in out_slots if v is not None]
-        if not valid_vecs:
-            return torch.empty(0)
-        return torch.stack(valid_vecs, dim=0)
+            if batch_out is not None and batch_out.numel() > 0:
+                collected.append(batch_out)
 
+        if not collected:
+            return torch.empty(0, dtype=torch.float32)
 
-def extract_across_layers(
-    extractor: "ActivationExtractor",
-    prompts: list[str],
-    layer_indices: list[int],
-    batch_size: int | None = None,
-    clear_cache_each_layer: bool = False,
-) -> dict[int, torch.Tensor]:
-    """Extract hidden states across multiple layer indices with optional per-layer cache cleanup."""
-    collected: dict[int, torch.Tensor] = {}
-    for layer_idx in layer_indices:
-        acts = extractor.extract_hidden_states(prompts, layer_idx, batch_size=batch_size)
-        collected[int(layer_idx)] = acts
-        if clear_cache_each_layer:
-            extractor.clear_cache()
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-    return collected
+        result_cpu = torch.cat(collected, dim=0).contiguous()
+        if use_cache:
+            self._cache[cache_key] = result_cpu
+        return result_cpu.to(self.device)

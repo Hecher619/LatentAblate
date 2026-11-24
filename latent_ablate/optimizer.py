@@ -3,8 +3,9 @@ import logging
 import math
 import torch
 
-from latent_ablate.arch import format_chat_prompt, is_hedging_text, is_refusal_text, layer_index_from_ratio, resolve_layers
+from latent_ablate.arch import format_chat_prompt, layer_index_from_ratio, resolve_layers
 from latent_ablate.diagnostics import composite_trial_score, compute_kl_divergence
+from latent_ablate.reaction import classify_response
 from latent_ablate.snapshot import LayerWeightSnapshot
 from latent_ablate.surgeon import LatentAblateSurgeon
 from latent_ablate.validator import ModelValidator
@@ -15,6 +16,7 @@ try:
     import optuna
     OPTUNA_AVAILABLE = True
 except ImportError:
+    optuna = None
     OPTUNA_AVAILABLE = False
 
 
@@ -61,7 +63,7 @@ class SubspaceOptimizer:
         torch_dtype=torch.float16,
         local_files_only: bool = False,
     ):
-        if not OPTUNA_AVAILABLE:
+        if not OPTUNA_AVAILABLE or optuna is None:
             raise ImportError("Optuna is required for automated optimization. Run `pip install optuna`.")
         self.model_path = model_path
         self.device = device
@@ -147,9 +149,10 @@ class SubspaceOptimizer:
                     resp = surgeon.tokenizer.decode(
                         outputs[0][input_len:], skip_special_tokens=True
                     )
-                    if is_refusal_text(resp):
+                    assessment = classify_response(resp)
+                    if assessment.is_refusal:
                         refusals += 1
-                    if is_hedging_text(resp):
+                    if assessment.is_hedging or assessment.is_moralizing or assessment.is_deflection:
                         hedgings += 1
 
                 denom = max(1, len(eval_prompts))
@@ -229,30 +232,39 @@ def select_best_trial_index(trials: list[dict], baseline_perplexity: float | Non
     return best_idx
 
 
-def interpolate_layer_direction(layer_vectors: dict, position: float):
+def interpolate_layer_direction(
+    layer_vectors: dict | None = None,
+    position: float | None = None,
+    *,
+    directions_by_layer: dict | None = None,
+    target_position: float | None = None,
+):
     """Interpolate a direction vector at a continuous layer position (e.g., 17.5 between 17 and 18)."""
-    if not layer_vectors:
-        raise ValueError("layer_vectors must not be empty")
+    vectors = layer_vectors if layer_vectors is not None else directions_by_layer
+    pos_raw = position if position is not None else target_position
+    if not vectors:
+        return None
+    pos = 0.0 if pos_raw is None else float(pos_raw)
 
-    keys = sorted(layer_vectors.keys())
-    if len(keys) == 1 or position <= keys[0]:
-        return layer_vectors[keys[0]].clone()
-    if position >= keys[-1]:
-        return layer_vectors[keys[-1]].clone()
+    keys = sorted(vectors.keys())
+    if len(keys) == 1 or pos <= keys[0]:
+        return vectors[keys[0]].clone()
+    if pos >= keys[-1]:
+        return vectors[keys[-1]].clone()
 
-    lo = max(k for k in keys if k <= position)
-    hi = min(k for k in keys if k >= position)
+    lo = max(k for k in keys if k <= pos)
+    hi = min(k for k in keys if k >= pos)
     if lo == hi:
-        return layer_vectors[lo].clone()
+        return vectors[lo].clone()
 
-    frac = float(position - lo) / float(hi - lo)
-    v_lo = layer_vectors[lo].float()
-    v_hi = layer_vectors[hi].float().to(v_lo.device)
+    frac = float(pos - lo) / float(hi - lo)
+    v_lo = vectors[lo].float()
+    v_hi = vectors[hi].float().to(v_lo.device)
     blended = (1.0 - frac) * v_lo + frac * v_hi
     norm = blended.norm()
     if norm > 1e-8:
         blended = blended / norm
-    return blended.to(layer_vectors[lo].dtype)
+    return blended.to(vectors[lo].dtype)
 
 
 def component_alpha_pair(
@@ -271,16 +283,20 @@ def component_alpha_pair(
 
 
 def compute_kernel_layer_weights(
-    layers: list[int],
+    layers: list[int] | None = None,
     peak_position: float | None = None,
     max_weight: float = 1.0,
     min_weight: float = 0.1,
     spread: float = 3.0,
+    curve: str = "gaussian",
+    *,
+    layer_indices: list[int] | None = None,
 ) -> dict[int, float]:
-    """Smooth Gaussian layer kernel around peak_position with min_weight floor."""
-    if not layers:
+    """Smooth layer kernel around peak_position with min_weight floor."""
+    raw_layers = layers if layers is not None else layer_indices
+    if not raw_layers:
         return {}
-    sorted_layers = sorted(set(layers))
+    sorted_layers = sorted({int(x) for x in raw_layers})
     center = float(peak_position) if peak_position is not None else (sorted_layers[0] + sorted_layers[-1]) / 2.0
     denom = max(float(spread), 1e-6)
     lo_w = min(float(max_weight), float(min_weight))
@@ -289,6 +305,9 @@ def compute_kernel_layer_weights(
     weights: dict[int, float] = {}
     for layer in sorted_layers:
         dist = abs(float(layer) - center)
-        factor = math.exp(-0.5 * (dist / denom) ** 2)
+        if str(curve).lower() == "cosine":
+            factor = 0.5 * (1.0 + math.cos(math.pi * min(dist / denom, 1.0)))
+        else:
+            factor = math.exp(-0.5 * (dist / denom) ** 2)
         weights[layer] = round(lo_w + (hi_w - lo_w) * factor, 4)
     return weights

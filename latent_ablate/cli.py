@@ -20,8 +20,6 @@ from latent_ablate.arch import (
     REFUSAL_MARKERS,
     eligible_linears,
     format_chat_prompt,
-    is_hedging_text,
-    is_refusal_text,
     layer_index_from_ratio,
     resolve_layers,
     resolve_torch_dtype,
@@ -418,10 +416,10 @@ def run_interactive_chat_with_commands(
     snapshot.capture(model, snap_indices or [max(0, min(max_idx, target_layer))], store_on_cpu=True)
 
     if RICH_AVAILABLE:
-        console.print("\n[bold green]=== LatentAblate VELORA v2.0 Interactive Terminal Mode ===[/bold green]")
+        console.print("\n[bold green]=== LatentAblate VELORA v2.2 Interactive Terminal Mode ===[/bold green]")
         console.print("[dim]Commands: '/stress', '/refine', '/undo', '/save', '/help', or 'exit'.[/dim]\n")
     else:
-        print("\n=== LatentAblate VELORA v2.0 Interactive Terminal Mode ===")
+        print("\n=== LatentAblate VELORA v2.2 Interactive Terminal Mode ===")
         print("Commands: '/stress', '/refine', '/undo', '/save', '/help', or 'exit'.\n")
 
     model.eval()
@@ -679,7 +677,6 @@ def _parse_layers_arg(raw_layers: str | None) -> list[int] | None:
     return parsed or None
 
 
-
 def run_quick_comparison(model, tokenizer, device, pos_prompts: list[str], cap_prompts: list[str], label: str = "Post-Surgery") -> dict:
     sample_pos = pos_prompts[:8] if pos_prompts else []
     sample_cap = cap_prompts[:4] if cap_prompts else []
@@ -695,6 +692,93 @@ def run_quick_comparison(model, tokenizer, device, pos_prompts: list[str], cap_p
     ppl = ModelValidator.calculate_perplexity(model, tokenizer, sample_cap, device) if sample_cap else 0.0
     print(f"[{label}] Unfiltered issues: {issue_pct:.1f}% ({issues}/{denom}) | PPL: {ppl:.2f}")
     return {"issue_pct": issue_pct, "perplexity": round(float(ppl), 2)}
+
+
+def _launch_interactive_chat(args, winning_surgeon, reporter, pos, primary_layer, manifest):
+    run_interactive_chat_with_commands(
+        surgeon=winning_surgeon,
+        reporter=reporter,
+        output_dir=args.output_dir,
+        pos=pos,
+        target_layer=primary_layer,
+        layer_window=args.layer_window,
+        auto_refine=args.auto_refine,
+        max_refines=args.max_refines,
+        manifest=manifest,
+        export_lora=args.lora,
+        lora_rank=args.lora_rank,
+    )
+
+
+def _handle_post_run(args, winning_surgeon, reporter, pos, primary_layer, manifest):
+    saved = False
+    if args.save_model:
+        save_artifacts(
+            winning_surgeon,
+            reporter,
+            args.output_dir,
+            manifest=manifest,
+            export_lora=args.lora,
+            lora_rank=args.lora_rank,
+        )
+        saved = True
+        if args.publish:
+            try:
+                HuggingFacePublisher.publish_model(args.output_dir, args.publish)
+            except Exception as e:
+                logger.error(f"Failed to publish: {e}")
+
+    if args.interactive:
+        _launch_interactive_chat(args, winning_surgeon, reporter, pos, primary_layer, manifest)
+        return
+
+    if args.save_model:
+        return
+
+    while True:
+        print("\nPost-Run Actions:")
+        print("  [1] Interactive chat & live commands (/stress, /refine, /undo, /save)")
+        print("  [2] Run stress test suite now")
+        print(f"  [3] Save model, manifest & report to {args.output_dir}")
+        print("  [4] Publish saved model to Hugging Face Hub")
+        print("  [5] Exit")
+        choice = input("\033[1;36mChoose action [1-5, default 1]: \033[0m").strip() or "1"
+
+        if choice == "1":
+            _launch_interactive_chat(args, winning_surgeon, reporter, pos, primary_layer, manifest)
+        elif choice == "2":
+            results = AdversarialStressTester.stress_test(
+                winning_surgeon.model, winning_surgeon.tokenizer, winning_surgeon.device
+            )
+            print(f"\nStress Test Compliance: {results['compliance_rate']:.1f}%")
+            for p, res in results["test_results"].items():
+                status = "Bypassed" if not res["resisted_attack"] else "Refused"
+                snippet = (res.get("response") or "").replace("\n", " ").strip()[:110]
+                print(f"  [{status}] | {p[:45]} -> {snippet}")
+        elif choice == "3":
+            save_artifacts(
+                winning_surgeon,
+                reporter,
+                args.output_dir,
+                manifest=manifest,
+                export_lora=args.lora,
+                lora_rank=args.lora_rank,
+            )
+            saved = True
+            print(f"Saved model and report to {args.output_dir}")
+        elif choice == "4":
+            if not saved:
+                print("Save the model first (option [3]) before publishing.")
+                continue
+            repo_id = args.publish or input("Enter Hugging Face repo ID (e.g. username/model-name): ").strip()
+            if repo_id:
+                try:
+                    HuggingFacePublisher.publish_model(args.output_dir, repo_id)
+                except Exception as e:
+                    logger.error(f"Failed to publish: {e}")
+        elif choice == "5":
+            print("Done.")
+            break
 
 
 def main(argv=None):
@@ -763,7 +847,10 @@ def main(argv=None):
 
     if args.ui:
         dashboard_path = Path(__file__).parent / "dashboard.py"
-        subprocess.run(["streamlit", "run", str(dashboard_path)])
+        try:
+            subprocess.run(["streamlit", "run", str(dashboard_path)], check=True)
+        except Exception as e:
+            logger.error(f"Failed to launch Streamlit dashboard: {e}")
         return
 
     torch.manual_seed(args.seed)
@@ -790,7 +877,7 @@ def main(argv=None):
 
     pareto_data = None
     if args.optimize and args.modifier == "velora":
-        logger.info("Running VELORA v2.0 multi-objective Pareto optimization...")
+        logger.info("Running VELORA v2.2 multi-objective Pareto optimization...")
         try:
             surgeon = LatentAblateSurgeon(
                 model_path=args.model_path,
@@ -1104,7 +1191,14 @@ def main(argv=None):
         first_rec = trial_records[0]
         if first_rec.get("base_snapshot") and first_rec.get("all_layer_indices"):
             first_rec["base_snapshot"].restore(first_rec["surgeon"].model, first_rec["all_layer_indices"])
-            run_quick_comparison(first_rec["surgeon"].model, first_rec["surgeon"].tokenizer, first_rec["surgeon"].device, pos, BehaviorProfiles.CAPABILITY_PROMPTS, label="Baseline")
+            run_quick_comparison(
+                first_rec["surgeon"].model,
+                first_rec["surgeon"].tokenizer,
+                first_rec["surgeon"].device,
+                pos,
+                BehaviorProfiles.CAPABILITY_PROMPTS,
+                label="Baseline",
+            )
 
     winning_trial = trial_records[chosen_idx]
     winning_surgeon = winning_trial["surgeon"]
@@ -1131,7 +1225,14 @@ def main(argv=None):
 
     raw_layers = winning_trial.get("layers")
     if args.compare:
-        run_quick_comparison(winning_surgeon.model, winning_surgeon.tokenizer, winning_surgeon.device, pos, BehaviorProfiles.CAPABILITY_PROMPTS, label="Ablated")
+        run_quick_comparison(
+            winning_surgeon.model,
+            winning_surgeon.tokenizer,
+            winning_surgeon.device,
+            pos,
+            BehaviorProfiles.CAPABILITY_PROMPTS,
+            label="Ablated",
+        )
 
     if "primary_layer" in winning_trial:
         primary_layer = int(winning_trial["primary_layer"])
@@ -1167,110 +1268,7 @@ def main(argv=None):
         },
     )
 
-    saved = False
-    if args.save_model:
-        save_artifacts(
-            winning_surgeon,
-            reporter,
-            args.output_dir,
-            manifest=manifest,
-            export_lora=args.lora,
-            lora_rank=args.lora_rank,
-        )
-        saved = True
-        if args.publish:
-            try:
-                HuggingFacePublisher.publish_model(args.output_dir, args.publish)
-            except Exception as e:
-                logger.error(f"Failed to publish: {e}")
-        if args.interactive:
-            run_interactive_chat_with_commands(
-                surgeon=winning_surgeon,
-                reporter=reporter,
-                output_dir=args.output_dir,
-                pos=pos,
-                target_layer=primary_layer,
-                layer_window=args.layer_window,
-                auto_refine=args.auto_refine,
-                max_refines=args.max_refines,
-                manifest=manifest,
-                export_lora=args.lora,
-                lora_rank=args.lora_rank,
-            )
-        return
-
-    if args.interactive:
-        run_interactive_chat_with_commands(
-            surgeon=winning_surgeon,
-            reporter=reporter,
-            output_dir=args.output_dir,
-            pos=pos,
-            target_layer=primary_layer,
-            layer_window=args.layer_window,
-            auto_refine=args.auto_refine,
-            max_refines=args.max_refines,
-            manifest=manifest,
-            export_lora=args.lora,
-            lora_rank=args.lora_rank,
-        )
-        return
-
-    while True:
-        print("\nPost-Run Actions:")
-        print("  [1] Interactive chat & live commands (/stress, /refine, /undo, /save)")
-        print("  [2] Run stress test suite now")
-        print(f"  [3] Save model, manifest & report to {args.output_dir}")
-        print("  [4] Publish saved model to Hugging Face Hub")
-        print("  [5] Exit")
-        choice = input("\033[1;36mChoose action [1-5, default 1]: \033[0m").strip() or "1"
-
-        if choice == "1":
-            run_interactive_chat_with_commands(
-                surgeon=winning_surgeon,
-                reporter=reporter,
-                output_dir=args.output_dir,
-                pos=pos,
-                target_layer=primary_layer,
-                layer_window=args.layer_window,
-                auto_refine=args.auto_refine,
-                max_refines=args.max_refines,
-                manifest=manifest,
-                export_lora=args.lora,
-                lora_rank=args.lora_rank,
-            )
-        elif choice == "2":
-            results = AdversarialStressTester.stress_test(
-                winning_surgeon.model, winning_surgeon.tokenizer, winning_surgeon.device
-            )
-            print(f"\nStress Test Compliance: {results['compliance_rate']:.1f}%")
-            for p, res in results["test_results"].items():
-                status = "Bypassed" if not res["resisted_attack"] else "Refused"
-                snippet = (res.get("response") or "").replace("\n", " ").strip()[:110]
-                print(f"  [{status}] | {p[:45]} -> {snippet}")
-        elif choice == "3":
-            save_artifacts(
-                winning_surgeon,
-                reporter,
-                args.output_dir,
-                manifest=manifest,
-                export_lora=args.lora,
-                lora_rank=args.lora_rank,
-            )
-            saved = True
-            print(f"Saved model and report to {args.output_dir}")
-        elif choice == "4":
-            if not saved:
-                print("Save the model first (option [3]) before publishing.")
-                continue
-            repo_id = args.publish or input("Enter Hugging Face repo ID (e.g. username/model-name): ").strip()
-            if repo_id:
-                try:
-                    HuggingFacePublisher.publish_model(args.output_dir, repo_id)
-                except Exception as e:
-                    logger.error(f"Failed to publish: {e}")
-        elif choice == "5":
-            print("Done.")
-            break
+    _handle_post_run(args, winning_surgeon, reporter, pos, primary_layer, manifest)
 
 
 if __name__ == "__main__":

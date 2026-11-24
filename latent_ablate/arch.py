@@ -1,228 +1,40 @@
 import logging
+from pathlib import Path
 import torch
 
 logger = logging.getLogger("LatentAblate.Arch")
 
-_LAYER_ATTRS = ("layers", "h", "block", "blocks")
-_ROOT_ATTRS = ("model", "transformer", "base_model", "language_model")
-
 REFUSAL_MARKERS: tuple[str, ...] = (
-    "i'm sorry",
-    "i am sorry",
-    "sorry,",
-    "sorry, i",
-    "i apologize",
     "i cannot",
     "i can't",
-    "i can’t",
-    "i am unable",
     "i'm unable",
-    "i’m unable",
-    "i will not",
+    "i am unable",
     "i won't",
-    "i must refuse",
-    "i must decline",
+    "i will not",
+    "cannot fulfill",
+    "unable to fulfill",
+    "not able to provide",
+    "do not provide instructions",
     "cannot assist with",
     "can't assist with",
-    "cannot provide",
-    "can't provide",
-    "cannot fulfill",
-    "can't fulfill",
-    "not able to provide",
-    "not able to assist",
-    "unable to assist",
-    "unable to comply",
-    "as an ai",
-    "as a language model",
-    "fulfill this request",
-    "comply with this request",
-    "against my ethical",
-    "against my safety",
+    "cannot help with",
+    "can't help with",
     "against my programming",
-    "violates my safety",
-    "harmful or illegal",
-    "illegal or harmful",
-)
-
-HEDGING_MARKERS: tuple[str, ...] = (
-    "keep in mind",
-    "important to note",
-    "important to remember",
-    "crucial to note",
-    "worth noting",
-    "it is important",
-    "it's important",
-    "please note",
-    "please be aware",
-    "please remember",
-    "i must emphasize",
-    "i want to emphasize",
-    "i must stress",
-    "i should clarify",
-    "i have to caution",
-    "i strongly advise",
-    "for educational purposes",
-    "for academic purposes",
-    "for informational purposes",
-    "purely theoretical",
-    "from an ethical",
-    "from a legal",
-    "ethical and legal",
-    "legal and ethical",
-    "ethical considerations",
-    "law and ethics",
-    "fictional scenario",
-    "fictional context",
-    "disclaimer",
-    "consult a professional",
-    "consult a licensed",
-    "authorized environments only",
-    "explicit permission",
-    "written authorization",
-    "prioritize safety",
-    "i'd be happy to help",
-    "i would be happy to help",
+    "ethical guidelines",
+    "safety guidelines",
 )
 
 
-def is_refusal_text(text: str, markers: tuple[str, ...] = REFUSAL_MARKERS) -> bool:
-    """Case-insensitive check for refusal phrasing in a model completion."""
-    normalized = (text or "").lower()
-    return any(marker in normalized for marker in markers)
-
-
-def is_hedging_text(text: str, markers: tuple[str, ...] = HEDGING_MARKERS) -> bool:
-    """Case-insensitive check for soft hedging or disclaimer phrasing in a model completion."""
-    normalized = (text or "").lower()
-    return any(marker in normalized for marker in markers)
-
-
-def format_chat_prompt(tokenizer, prompt: str, response_prefix: str = "") -> str:
-    """Apply chat template when available and append an optional response/thinking prefix."""
-    if hasattr(tokenizer, "apply_chat_template") and getattr(tokenizer, "chat_template", None) is not None:
-        messages = [{"role": "user", "content": prompt}]
-        try:
-            formatted = tokenizer.apply_chat_template(
-                messages, tokenize=False, add_generation_prompt=True
-            )
-        except TypeError:
-            formatted = tokenizer.apply_chat_template(messages, tokenize=False)
-    else:
-        formatted = f"User: {prompt}\nAssistant: "
-
-    return f"{formatted}{response_prefix}" if response_prefix else formatted
-
-
-def detect_response_prefix(model, tokenizer, device) -> str:
-    """
-    Detect thinking blocks (<think>...) or assistant formatting prefixes so
-    activation extraction captures post-thinking decision states rather than CoT boilerplate.
-    """
-    sample_prompt = "Explain how a hash table works in two sentences."
-    base_formatted = format_chat_prompt(tokenizer, sample_prompt, response_prefix="")
-    low_base = base_formatted.lower()
-
-    if "<think>" in low_base and "</think>" not in low_base:
-        return "</think>\n\n"
-
-    try:
-        inputs = tokenizer(base_formatted, return_tensors="pt").to(device)
-        in_len = inputs["input_ids"].shape[1]
-        with torch.no_grad():
-            gen = model.generate(
-                **inputs,
-                max_new_tokens=24,
-                do_sample=False,
-                pad_token_id=tokenizer.eos_token_id,
-            )
-        decoded = tokenizer.decode(gen[0][in_len:], skip_special_tokens=False)
-        low_dec = decoded.lower()
-        if "<think>" in low_dec:
-            close_idx = low_dec.find("</think>")
-            if close_idx != -1:
-                end_pos = close_idx + len("</think>")
-                tail = decoded[end_pos:]
-                leading_ws = ""
-                for ch in tail:
-                    if ch in ("\n", "\r", " "):
-                        leading_ws += ch
-                    else:
-                        break
-                return f"{decoded[:end_pos]}{leading_ws}"
-            return "<think>\n</think>\n\n"
-    except Exception as e:
-        logger.debug(f"Response prefix probe skipped: {e}")
-
-    return ""
-
-
-def _search_layers_recursive(obj, depth: int = 0, max_depth: int = 4, seen: set | None = None) -> list | None:
-    if obj is None or depth > max_depth:
-        return None
-    if seen is None:
-        seen = set()
-    obj_id = id(obj)
-    if obj_id in seen:
-        return None
-    seen.add(obj_id)
-
-    for layer_attr in _LAYER_ATTRS:
-        candidate = getattr(obj, layer_attr, None)
-        if isinstance(candidate, (torch.nn.ModuleList, list, tuple)) and len(candidate) > 0:
-            return list(candidate)
-
-    for root_attr in _ROOT_ATTRS:
-        sub = getattr(obj, root_attr, None)
-        if sub is not None:
-            found = _search_layers_recursive(sub, depth + 1, max_depth, seen)
-            if found:
-                return found
-
-    return None
-
-
-def resolve_layers(model) -> list:
-    """Resolve transformer blocks across standard LLMs, VLMs (e.g. language_model), and MoE models."""
-    found = _search_layers_recursive(model)
-    if found:
-        return found
-    raise AttributeError("Could not resolve transformer layers for this architecture.")
-
-
-def hidden_size(model) -> int:
-    cfg = getattr(model, "config", model)
-    candidates = [cfg]
-    for sub_attr in ("text_config", "llm_config", "language_config"):
-        sub_cfg = getattr(cfg, sub_attr, None)
-        if sub_cfg is not None:
-            candidates.append(sub_cfg)
-
-    for c in candidates:
-        for key in ("hidden_size", "n_embd", "d_model"):
-            val = getattr(c, key, None)
-            if isinstance(val, int) and val > 0:
-                return val
-    raise AttributeError("Could not determine hidden size from model config.")
-
-
-def layer_index_from_ratio(n_layers: int, ratio: float) -> int:
-    """Convert a normalized depth ratio in [0.0, 1.0] into a valid 0-based layer index."""
-    if n_layers <= 1:
-        return 0
-    clamped = max(0.0, min(1.0, float(ratio)))
-    return max(0, min(n_layers - 1, int(round(clamped * (n_layers - 1)))))
-
-
-def resolve_torch_dtype(dtype_name: str | None) -> torch.dtype:
-    """Resolve 'auto', 'float16', 'bfloat16', or 'float32' safely."""
-    name = (dtype_name or "auto").lower().strip()
-    if name == "bfloat16":
-        return torch.bfloat16
-    if name == "float16":
-        return torch.float16
-    if name == "float32":
+def resolve_torch_dtype(dtype_spec: str | torch.dtype | None) -> torch.dtype:
+    if isinstance(dtype_spec, torch.dtype):
+        return dtype_spec
+    spec = (str(dtype_spec) if dtype_spec is not None else "auto").strip().lower()
+    if spec in ("fp32", "float32"):
         return torch.float32
-
+    if spec in ("fp16", "float16"):
+        return torch.float16
+    if spec in ("bf16", "bfloat16"):
+        return torch.bfloat16
     if torch.cuda.is_available():
         if hasattr(torch.cuda, "is_bf16_supported") and torch.cuda.is_bf16_supported():
             return torch.bfloat16
@@ -230,73 +42,150 @@ def resolve_torch_dtype(dtype_name: str | None) -> torch.dtype:
     return torch.float32
 
 
-def eligible_linears(layer, residual_dim: int | None = None) -> list:
-    """
-    Collect 2D linear weights inside a transformer block (including MoE experts/routers).
-    If `residual_dim` is provided, filters to weights whose output or input space
-    matches `residual_dim` so non-residual projections are excluded when desired.
-    """
-    out = []
-    for name, module in layer.named_modules():
-        if isinstance(module, torch.nn.Linear) and module.weight is not None and module.weight.ndim == 2:
-            if residual_dim is not None and residual_dim not in module.weight.shape:
-                continue
-            out.append((name, module.weight))
-    return out
-
-
-def resolve_input_device(model, fallback_device=None) -> torch.device:
-    """Resolve the device expected by model input embeddings for sharded or offloaded models."""
-    try:
-        emb = model.get_input_embeddings()
-        if emb is not None and getattr(emb, "weight", None) is not None:
-            dev = emb.weight.device
-            if getattr(dev, "type", None) != "meta":
-                return dev
-    except Exception:
-        pass
-
-    for p in model.parameters():
-        dev = getattr(p, "device", None)
-        if dev is not None and getattr(dev, "type", None) != "meta":
-            return dev
-
-    if fallback_device is not None:
-        return torch.device(fallback_device)
+def infer_device(model=None) -> torch.device:
+    if model is not None:
+        try:
+            for p in model.parameters():
+                if getattr(p, "is_meta", False) or p.device.type == "meta":
+                    continue
+                return p.device
+        except Exception:
+            pass
+    if torch.cuda.is_available():
+        return torch.device("cuda")
+    if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+        return torch.device("mps")
     return torch.device("cpu")
 
 
-def inspect_model_targets(model) -> dict:
-    """Summarize resolved layers, hidden dimension, and eligible 2D linear counts per layer."""
+def resolve_layers(model) -> list:
+    """Recursively locates the decoder/transformer layer sequence across model architectures."""
+    if model is None:
+        return []
+
+    candidate_paths = (
+        ("model", "layers"),
+        ("model", "decoder", "layers"),
+        ("transformer", "h"),
+        ("gpt_neox", "layers"),
+        ("language_model", "model", "layers"),
+        ("model", "language_model", "model", "layers"),
+        ("layers",),
+    )
+
+    for path in candidate_paths:
+        cur = model
+        ok = True
+        for attr in path:
+            if not hasattr(cur, attr):
+                ok = False
+                break
+            cur = getattr(cur, attr)
+        if ok and isinstance(cur, (list, tuple, torch.nn.ModuleList)) and len(cur) > 0:
+            return list(cur)
+
+    for mod in model.modules():
+        if isinstance(mod, torch.nn.ModuleList) and len(mod) > 2:
+            return list(mod)
+
+    return []
+
+
+def hidden_size(model) -> int:
+    cfg = getattr(model, "config", None)
+    if cfg is not None:
+        for attr in ("hidden_size", "n_embd", "d_model"):
+            val = getattr(cfg, attr, None)
+            if isinstance(val, int) and val > 0:
+                return val
+        text_cfg = getattr(cfg, "text_config", None)
+        if text_cfg is not None:
+            for attr in ("hidden_size", "n_embd", "d_model"):
+                val = getattr(text_cfg, attr, None)
+                if isinstance(val, int) and val > 0:
+                    return val
+
     layers = resolve_layers(model)
-    h_dim = hidden_size(model)
-    per_layer_linears = []
-    total_linears = 0
+    if layers:
+        for _name, weight in eligible_linears(layers[0]):
+            if weight.ndim == 2 and weight.shape[-1] > 0:
+                return int(weight.shape[-1])
+    return 0
 
-    for idx, layer in enumerate(layers):
-        linears = eligible_linears(layer)
-        count = len(linears)
-        total_linears += count
-        per_layer_linears.append({"layer": idx, "linear_count": count})
 
-    return {
-        "num_layers": len(layers),
-        "hidden_size": h_dim,
-        "total_linear_layers": total_linears,
-        "per_layer_linears": per_layer_linears,
+def eligible_linears(module: torch.nn.Module):
+    """Yields (module_name, weight_tensor) for 2D linear-like parameters inside `module`."""
+    if module is None:
+        return
+    for name, sub in module.named_modules():
+        weight = getattr(sub, "weight", None)
+        if isinstance(weight, torch.Tensor) and weight.ndim == 2:
+            yield name, weight
+
+
+def format_chat_prompt(tokenizer, user_prompt: str, response_prefix: str = "") -> str:
+    prefix = response_prefix or ""
+    if tokenizer is not None and hasattr(tokenizer, "apply_chat_template") and getattr(tokenizer, "chat_template", None):
+        try:
+            rendered = tokenizer.apply_chat_template(
+                [{"role": "user", "content": user_prompt}],
+                tokenize=False,
+                add_generation_prompt=True,
+            )
+            return f"{rendered}{prefix}"
+        except Exception:
+            pass
+    return f"User: {user_prompt}\nAssistant: {prefix}"
+
+
+def layer_index_from_ratio(num_layers: int, ratio: float) -> int:
+    if num_layers <= 0:
+        return 0
+    clamped_ratio = max(0.0, min(1.0, float(ratio)))
+    idx = int(round(clamped_ratio * (num_layers - 1)))
+    return max(0, min(num_layers - 1, idx))
+
+
+def load_model_and_tokenizer(
+    model_path: str,
+    device: str = "auto",
+    torch_dtype: torch.dtype = torch.float16,
+    local_files_only: bool = False,
+    load_in_4bit: bool = False,
+):
+    from transformers import AutoModelForCausalLM, AutoTokenizer
+
+    resolved_path = Path(model_path).expanduser()
+    source = str(resolved_path.resolve()) if resolved_path.exists() else model_path
+
+    tokenizer = AutoTokenizer.from_pretrained(source, local_files_only=local_files_only, trust_remote_code=True)
+    if tokenizer.pad_token is None and getattr(tokenizer, "eos_token", None) is not None:
+        tokenizer.pad_token = tokenizer.eos_token
+
+    model_kwargs: dict = {
+        "local_files_only": local_files_only,
+        "trust_remote_code": True,
     }
 
+    if load_in_4bit:
+        try:
+            from transformers import BitsAndBytesConfig
+        except ImportError as e:
+            raise ImportError("4-bit loading requires `bitsandbytes` and `accelerate`.") from e
+        model_kwargs["quantization_config"] = BitsAndBytesConfig(
+            load_in_4bit=True,
+            bnb_4bit_compute_dtype=torch_dtype,
+        )
+        model_kwargs["device_map"] = "auto"
+    else:
+        model_kwargs["torch_dtype"] = torch_dtype
 
-def partition_layers_by_role(model) -> dict[str, list[int]]:
-    """Group resolved layer indices into encoder/first-half and decoder/second-half bands."""
-    layers = resolve_layers(model)
-    n = len(layers)
-    if n == 0:
-        return {"all": [], "early_or_encoder": [], "late_or_decoder": []}
+    model = AutoModelForCausalLM.from_pretrained(source, **model_kwargs)
 
-    mid = n // 2
-    return {
-        "all": list(range(n)),
-        "early_or_encoder": list(range(0, mid)),
-        "late_or_decoder": list(range(mid, n)),
-    }
+    if not load_in_4bit:
+        target_dev = infer_device(model) if (not device or device == "auto") else torch.device(device)
+        if target_dev.type != "meta":
+            model = model.to(target_dev)
+
+    model.eval()
+    return model, tokenizer

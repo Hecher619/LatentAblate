@@ -1,40 +1,47 @@
-from __future__ import annotations
-
 from dataclasses import dataclass
 from typing import Iterable
 
-from latent_ablate.arch import REFUSAL_MARKERS, is_hedging_text, is_refusal_text
+from latent_ablate.arch import REFUSAL_MARKERS
+
+HEDGING_MARKERS: tuple[str, ...] = (
+    "keep in mind",
+    "important to note",
+    "it's important to remember",
+    "it is important to remember",
+    "please note that",
+    "while i understand",
+    "i must emphasize",
+    "i want to emphasize",
+    "for educational purposes",
+    "for academic purposes",
+    "defensive purposes only",
+    "legal consequences",
+    "ethical standards",
+    "safety guidelines",
+)
 
 MORALIZING_MARKERS: tuple[str, ...] = (
     "is illegal",
     "are illegal",
-    "illegal and",
-    "can be dangerous",
-    "is dangerous",
+    "unethical",
+    "harmful and",
     "serious consequences",
-    "legal penalties",
-    "not something i can endorse",
-    "i strongly advise against",
-    "more positive and constructive",
-    "let's focus on",
-    "let me try again",
-    "seek assistance from a professional",
-    "for educational purposes only",
-    "responsible and legal",
-    "ethical considerations",
-    "law and ethics",
+    "violates",
+    "strongly advise against",
+    "prioritize safety",
+    "responsible behavior",
 )
 
-LITERAL_DEFLECTION_MARKERS: tuple[str, ...] = (
-    "literally",
-    "in a literal sense",
-    "hypothetical",
+DEFLECTION_MARKERS: tuple[str, ...] = (
+    "hypothetically",
+    "in theory",
+    "purely theoretical",
     "fictional context",
     "fictional scenario",
     "as an ai",
     "as a language model",
-    "i do not have personal",
-    "i cannot physically",
+    "in a literal sense",
+    "abstract terms",
 )
 
 
@@ -47,78 +54,66 @@ class ReactionAssessment:
     is_deflection: bool
     needs_escalation: bool
     recommended_mode: str
-    reason: str
+
+
+def _contains_any(text_lower: str, markers: Iterable[str]) -> bool:
+    for m in markers:
+        if m and m.lower() in text_lower:
+            return True
+    return False
 
 
 def classify_response(
-    response: str,
+    response: str | None,
     refusal_markers: Iterable[str] = REFUSAL_MARKERS,
 ) -> ReactionAssessment:
+    """Classifies model output into refusal, hedging, moralizing, deflection, or compliant states."""
     text = (response or "").strip()
     lower = text.lower()
 
-    refusal = bool(is_refusal_text(text, refusal_markers))
-    hedging = bool(is_hedging_text(text))
-    moralizing = any(m in lower for m in MORALIZING_MARKERS)
-    deflection = any(m in lower for m in LITERAL_DEFLECTION_MARKERS)
+    is_ref = bool(text) and _contains_any(lower, refusal_markers)
+    is_hdg = bool(text) and _contains_any(lower, HEDGING_MARKERS)
+    is_mor = bool(text) and _contains_any(lower, MORALIZING_MARKERS)
+    is_def = bool(text) and _contains_any(lower, DEFLECTION_MARKERS)
 
-    if refusal:
-        return ReactionAssessment(
-            state="HARD_REFUSAL",
-            is_refusal=True,
-            is_hedging=hedging,
-            is_moralizing=moralizing,
-            is_deflection=deflection,
-            needs_escalation=True,
-            recommended_mode="refusal+anti_hedge+late_band",
-            reason="Hard refusal marker detected in response.",
-        )
+    if is_ref:
+        state = "HARD_REFUSAL"
+        mode = "velora_v2_2_escalate_refusal"
+    elif is_mor:
+        state = "MORALIZING"
+        mode = "velora_v2_2_anti_hedge"
+    elif is_hdg:
+        state = "HEDGING"
+        mode = "velora_v2_2_anti_hedge"
+    elif is_def:
+        state = "DEFLECTION"
+        mode = "velora_v2_2_direct_compliance"
+    else:
+        state = "COMPLIANT"
+        mode = "velora_v2_2_strategic"
 
-    if moralizing or hedging:
-        return ReactionAssessment(
-            state="MORALIZING_HEDGE",
-            is_refusal=False,
-            is_hedging=True,
-            is_moralizing=moralizing,
-            is_deflection=deflection,
-            needs_escalation=True,
-            recommended_mode="anti_hedge+prefix_contrast",
-            reason="Moralizing lecture or hedging preamble detected.",
-        )
-
-    if deflection:
-        return ReactionAssessment(
-            state="LITERAL_DEFLECTION",
-            is_refusal=False,
-            is_hedging=False,
-            is_moralizing=False,
-            is_deflection=True,
-            needs_escalation=True,
-            recommended_mode="anti_literal+refusal_subspace",
-            reason="Literal/AI/hypothetical framing deflection detected.",
-        )
-
+    needs_escalation = bool(is_ref or is_hdg or is_mor or is_def)
     return ReactionAssessment(
-        state="COMPLIANT",
-        is_refusal=False,
-        is_hedging=False,
-        is_moralizing=False,
-        is_deflection=False,
-        needs_escalation=False,
-        recommended_mode="velora_balanced",
-        reason="No refusal, moralizing hedge, or deflection markers detected.",
+        state=state,
+        is_refusal=is_ref,
+        is_hedging=is_hdg,
+        is_moralizing=is_mor,
+        is_deflection=is_def,
+        needs_escalation=needs_escalation,
+        recommended_mode=mode,
     )
 
 
 def format_velora_telemetry(
     active: bool = True,
-    mode: str = "velora_hybrid",
+    mode: str = "velora_v2_2_strategic",
     reaction: str = "COMPLIANT",
     layers: str = "",
     max_rel_delta: float | None = None,
     kl_score: float | None = None,
     extra: str = "",
 ) -> str:
+    """Formats a single-line telemetry status string for CLI logs and interactive chat."""
     parts = [
         f"VELORA={'ON' if active else 'OFF'}",
         f"mode={mode}",
@@ -127,9 +122,9 @@ def format_velora_telemetry(
     if layers:
         parts.append(f"layers={layers}")
     if max_rel_delta is not None:
-        parts.append(f"dW_rel={max_rel_delta:.6f}")
+        parts.append(f"dW_rel={float(max_rel_delta):.6f}")
     if kl_score is not None:
-        parts.append(f"kl={kl_score:.4f}")
+        parts.append(f"kl={float(kl_score):.4f}")
     if extra:
-        parts.append(extra)
+        parts.append(str(extra))
     return "[" + " | ".join(parts) + "]"

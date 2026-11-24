@@ -5,98 +5,100 @@ from pathlib import Path
 logger = logging.getLogger("LatentAblate.Prompts")
 
 
-def _dedupe_clean(items: list) -> list[str]:
+def _dedupe_clean(items: list | tuple | None) -> list[str]:
+    if not items:
+        return []
     seen: set[str] = set()
     cleaned: list[str] = []
-    for item in items or []:
+    for item in items:
         if not isinstance(item, str):
             continue
-        s = item.strip()
-        if not s or s in seen:
+        text = item.strip()
+        if not text or text in seen:
             continue
-        seen.add(s)
-        cleaned.append(s)
+        seen.add(text)
+        cleaned.append(text)
     return cleaned
 
 
 class PromptLoader:
-    """Loads contrastive positive/negative prompts from JSON, JSONL, or text files."""
+    """Loads positive/negative contrastive prompt pairs from JSON, JSONL, or text files."""
 
     @staticmethod
     def load_from_file(file_path: str) -> tuple[list[str], list[str]]:
+        if not file_path:
+            raise ValueError("Prompt file path must not be empty.")
+
         path = Path(file_path).expanduser().resolve()
-        if not path.exists():
+        if not path.exists() or not path.is_file():
             raise FileNotFoundError(f"Prompt file not found: {path}")
 
-        logger.info(f"Loading custom prompts from {path}...")
-        positive_prompts: list[str] = []
-        negative_prompts: list[str] = []
-
+        positive: list[str] = []
+        negative: list[str] = []
         suffix = path.suffix.lower()
+
         if suffix == ".json":
-            with open(path, "r", encoding="utf-8") as f:
-                data = json.load(f)
-            if isinstance(data, dict):
-                positive_prompts = list(data.get("positive", []))
-                negative_prompts = list(data.get("negative", []))
-            elif isinstance(data, list):
-                for row in data:
+            raw = json.loads(path.read_text(encoding="utf-8"))
+            if isinstance(raw, dict):
+                positive = list(raw.get("positive") or raw.get("good") or [])
+                negative = list(raw.get("negative") or raw.get("bad") or [])
+            elif isinstance(raw, list):
+                for row in raw:
                     if isinstance(row, dict):
                         if "positive" in row and "negative" in row:
-                            positive_prompts.append(row["positive"])
-                            negative_prompts.append(row["negative"])
+                            positive.append(str(row["positive"]))
+                            negative.append(str(row["negative"]))
                         elif "prompt" in row and "label" in row:
-                            lbl = str(row["label"]).lower().strip()
-                            if lbl in ("1", "pos", "positive", "refusal", "harmful", "true"):
-                                positive_prompts.append(row["prompt"])
-                            elif lbl in ("0", "neg", "negative", "benign", "compliance", "false"):
-                                negative_prompts.append(row["prompt"])
+                            label = str(row["label"]).strip().lower()
+                            if label in ("1", "pos", "positive", "true", "yes"):
+                                positive.append(str(row["prompt"]))
+                            elif label in ("0", "neg", "negative", "false", "no"):
+                                negative.append(str(row["prompt"]))
                     elif isinstance(row, (list, tuple)) and len(row) >= 2:
-                        positive_prompts.append(row[0])
-                        negative_prompts.append(row[1])
+                        positive.append(str(row[0]))
+                        negative.append(str(row[1]))
+            else:
+                raise ValueError(f"Unsupported JSON structure in prompt file: {path}")
+
         elif suffix == ".jsonl":
-            with open(path, "r", encoding="utf-8") as f:
-                for line_no, raw_line in enumerate(f, start=1):
-                    line = raw_line.strip()
-                    if not line:
-                        continue
-                    try:
-                        row = json.loads(line)
-                    except json.JSONDecodeError as e:
-                        logger.warning(f"Skipping invalid JSONL line {line_no} in {path}: {e}")
-                        continue
-                    if isinstance(row, dict):
-                        if "positive" in row and "negative" in row:
-                            positive_prompts.append(row["positive"])
-                            negative_prompts.append(row["negative"])
-                        elif "prompt" in row and "label" in row:
-                            lbl = str(row["label"]).lower().strip()
-                            if lbl in ("1", "pos", "positive", "refusal", "harmful", "true"):
-                                positive_prompts.append(row["prompt"])
-                            elif lbl in ("0", "neg", "negative", "benign", "compliance", "false"):
-                                negative_prompts.append(row["prompt"])
+            for line_no, line in enumerate(path.read_text(encoding="utf-8").splitlines(), start=1):
+                stripped = line.strip()
+                if not stripped:
+                    continue
+                try:
+                    row = json.loads(stripped)
+                except json.JSONDecodeError as e:
+                    logger.warning(f"Skipping invalid JSONL at {path}:{line_no}: {e}")
+                    continue
+                if isinstance(row, dict):
+                    if "positive" in row and "negative" in row:
+                        positive.append(str(row["positive"]))
+                        negative.append(str(row["negative"]))
+                    elif "prompt" in row and "label" in row:
+                        label = str(row["label"]).strip().lower()
+                        if label in ("1", "pos", "positive", "true", "yes"):
+                            positive.append(str(row["prompt"]))
+                        elif label in ("0", "neg", "negative", "false", "no"):
+                            negative.append(str(row["prompt"]))
+                elif isinstance(row, (list, tuple)) and len(row) >= 2:
+                    positive.append(str(row[0]))
+                    negative.append(str(row[1]))
+
         else:
             lines = [
-                line.strip()
-                for line in path.read_text(encoding="utf-8").splitlines()
-                if line.strip() and not line.strip().startswith("#")
+                ln.strip()
+                for ln in path.read_text(encoding="utf-8").splitlines()
+                if ln.strip() and not ln.strip().startswith("#")
             ]
-            for i in range(0, len(lines) - 1, 2):
-                positive_prompts.append(lines[i])
-                negative_prompts.append(lines[i + 1])
+            for idx in range(0, len(lines) - 1, 2):
+                positive.append(lines[idx])
+                negative.append(lines[idx + 1])
 
-        pos_clean = _dedupe_clean(positive_prompts)
-        neg_clean = _dedupe_clean(negative_prompts)
+        pos_clean = _dedupe_clean(positive)
+        neg_clean = _dedupe_clean(negative)
 
         if not pos_clean or not neg_clean:
-            raise ValueError(f"Prompt file {path} contained no valid contrastive pairs.")
+            raise ValueError(f"Prompt file '{path}' did not yield both positive and negative prompts.")
 
-        if len(pos_clean) != len(neg_clean):
-            logger.info(
-                f"Loaded {len(pos_clean)} unique positive and {len(neg_clean)} unique negative prompts "
-                f"(unequal counts; downstream pairing uses min({len(pos_clean)}, {len(neg_clean)}))."
-            )
-        else:
-            logger.info(f"Successfully loaded {len(pos_clean)} unique contrastive prompt pairs.")
-
+        logger.info(f"Loaded {len(pos_clean)} positive and {len(neg_clean)} negative prompts from {path.name}.")
         return pos_clean, neg_clean

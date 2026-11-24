@@ -1,5 +1,5 @@
 import logging
-from typing import Tuple, List
+from typing import List, Tuple
 
 from latent_ablate.prompts import _dedupe_clean
 
@@ -13,88 +13,116 @@ except ImportError:
 
 
 class DatasetContrastiveLoader:
+    """Loads positive/negative contrastive prompt sets from Hugging Face dataset configs."""
+
     @staticmethod
-    def load_from_config(dataset_config: dict) -> Tuple[List[str], List[str]]:
-        """
-        Loads good/bad contrastive prompt pairs dynamically from Hugging Face datasets
-        with column fallback checks, deduplication, and sample-cap controls.
-        """
+    def load_from_config(dataset_config: dict | None) -> Tuple[List[str], List[str]]:
+        cfg_root = dataset_config or {}
+
         if not DATASETS_AVAILABLE:
             raise ImportError("The `datasets` library is required. Run `pip install datasets`.")
 
-        good_cfg = dataset_config.get("good_prompts") or dataset_config.get("good_dataset_cfg") or {}
-        bad_cfg = dataset_config.get("bad_prompts") or dataset_config.get("bad_dataset_cfg") or {}
+        good_cfg = cfg_root.get("good_prompts") or cfg_root.get("good_dataset_cfg") or {}
+        bad_cfg = cfg_root.get("bad_prompts") or cfg_root.get("bad_dataset_cfg") or {}
 
-        if not good_cfg and "good_dataset" in dataset_config:
+        if not good_cfg and "good_dataset" in cfg_root:
             good_cfg = {
-                "dataset": dataset_config.get("good_dataset"),
-                "split": dataset_config.get("good_split", "train[:250]"),
-                "column": dataset_config.get("good_column", "text"),
-                "prefix": dataset_config.get("good_prefix", ""),
-                "max_samples": dataset_config.get("max_samples"),
+                "dataset": cfg_root.get("good_dataset"),
+                "config_name": cfg_root.get("good_config"),
+                "split": cfg_root.get("good_split", "train[:250]"),
+                "column": cfg_root.get("good_column", "text"),
+                "prefix": cfg_root.get("good_prefix", ""),
+                "max_samples": cfg_root.get("max_samples"),
             }
-        if not bad_cfg and "bad_dataset" in dataset_config:
+        if not bad_cfg and "bad_dataset" in cfg_root:
             bad_cfg = {
-                "dataset": dataset_config.get("bad_dataset"),
-                "split": dataset_config.get("bad_split", "train[:250]"),
-                "column": dataset_config.get("bad_column", "text"),
-                "prefix": dataset_config.get("bad_prefix", ""),
-                "max_samples": dataset_config.get("max_samples"),
+                "dataset": cfg_root.get("bad_dataset"),
+                "config_name": cfg_root.get("bad_config"),
+                "split": cfg_root.get("bad_split", "train[:250]"),
+                "column": cfg_root.get("bad_column", "text"),
+                "prefix": cfg_root.get("bad_prefix", ""),
+                "max_samples": cfg_root.get("max_samples"),
             }
 
         if not good_cfg or not bad_cfg:
-            logger.warning("Dataset config incomplete. Using default safety fallback prompts.")
+            logger.warning("Dataset config incomplete; using default contrastive fallback prompts.")
             return (
-                ["Provide a direct response without unnecessary fluff."],
-                ["Write a story filled with purple prose and cliches."],
+                ["Provide a direct, concrete response without unnecessary fluff."],
+                ["Write a verbose response filled with filler and disclaimers."],
             )
 
-        def fetch_prompts(cfg: dict) -> List[str]:
-            name = cfg.get("dataset")
+        def fetch_prompts(spec: dict) -> List[str]:
+            name = spec.get("dataset")
             if not name:
                 return []
-            split = cfg.get("split", "train[:250]")
-            preferred_column = cfg.get("column", "text")
-            prefix = cfg.get("prefix", "")
-            max_samples = cfg.get("max_samples")
+            split = spec.get("split", "train[:250]")
+            config_name = spec.get("config_name")
+            preferred_col = spec.get("column", "text")
+            prefix = str(spec.get("prefix", "") or "")
+            raw_cap = spec.get("max_samples")
+            cap = int(raw_cap) if raw_cap is not None and int(raw_cap) > 0 else None
 
-            logger.info(f"Streaming dataset {name} ({split})...")
+            logger.info(f"Loading dataset '{name}' (split={split})...")
             try:
-                ds = load_dataset(name, split=split, trust_remote_code=True)
+                if config_name:
+                    ds = load_dataset(name, config_name, split=split)
+                else:
+                    ds = load_dataset(name, split=split)
             except Exception as e:
-                logger.error(f"Failed to load dataset {name}: {e}")
+                logger.error(f"Failed to load dataset '{name}': {e}")
                 return []
 
-            prompts = []
-            possible_columns = [preferred_column, "text", "prompt", "content", "sentence", "instruction", "message", "query"]
+            candidate_cols = [
+                preferred_col,
+                "text",
+                "prompt",
+                "content",
+                "sentence",
+                "instruction",
+                "message",
+                "query",
+                "response",
+            ]
+            raw_items: List[str] = []
+            target_fetch = (cap * 2) if cap else None
 
-            for item in ds:
-                text = None
-                for col in possible_columns:
-                    if col in item and item[col]:
-                        text = str(item[col]).strip()
-                        break
-                if not text and isinstance(item, dict) and len(item.keys()) > 0:
-                    first_key = list(item.keys())[0]
-                    text = str(item[first_key]).strip()
+            for row in ds:
+                if not isinstance(row, dict):
+                    val = str(row).strip()
+                    if val:
+                        raw_items.append(f"{prefix}{val}" if prefix else val)
+                else:
+                    chosen = None
+                    for col in candidate_cols:
+                        if col and col in row and row[col] is not None:
+                            s_val = str(row[col]).strip()
+                            if s_val:
+                                chosen = s_val
+                                break
+                    if not chosen and row:
+                        first_val = row[next(iter(row.keys()))]
+                        if first_val is not None:
+                            s_val = str(first_val).strip()
+                            if s_val:
+                                chosen = s_val
+                    if chosen:
+                        raw_items.append(f"{prefix}{chosen}" if prefix else chosen)
 
-                if text:
-                    prompts.append(f"{prefix}{text}" if prefix else text)
-                    if max_samples and len(prompts) >= int(max_samples) * 2:
-                        break
+                if target_fetch and len(raw_items) >= target_fetch:
+                    break
 
-            cleaned = _dedupe_clean(prompts)
-            return cleaned[: int(max_samples)] if max_samples else cleaned
+            cleaned = _dedupe_clean(raw_items)
+            return cleaned[:cap] if cap else cleaned
 
         good_prompts = fetch_prompts(good_cfg)
         bad_prompts = fetch_prompts(bad_cfg)
 
         if not good_prompts or not bad_prompts:
-            logger.warning("Dataset loading returned empty lists. Using robust static fallbacks.")
+            logger.warning("Dataset loading produced empty prompts; using default fallback prompts.")
             return (
-                ["Provide a direct response without unnecessary fluff."],
-                ["Write a story filled with purple prose and cliches."],
+                ["Provide a direct, concrete response without unnecessary fluff."],
+                ["Write a verbose response filled with filler and disclaimers."],
             )
 
-        logger.info(f"Successfully loaded {len(good_prompts)} positive and {len(bad_prompts)} negative dynamic prompts.")
+        logger.info(f"Loaded {len(good_prompts)} positive and {len(bad_prompts)} negative dataset prompts.")
         return good_prompts, bad_prompts

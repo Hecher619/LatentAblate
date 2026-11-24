@@ -4,9 +4,22 @@ import torch
 logger = logging.getLogger("LatentAblate.Subspace")
 
 
-def _winsorize(tensor: torch.Tensor, percentile: float = 0.995, max_quantile_elems: int = 262_144) -> torch.Tensor:
+def _is_meta(tensor: torch.Tensor | None) -> bool:
+    if tensor is None:
+        return False
+    if getattr(tensor, "is_meta", False):
+        return True
+    dev = getattr(tensor, "device", None)
+    return dev is not None and dev.type == "meta"
+
+
+def _winsorize(
+    tensor: torch.Tensor,
+    percentile: float = 0.995,
+    max_quantile_elems: int = 262_144,
+) -> torch.Tensor:
     """Clip extreme magnitude outliers to stabilize SVD calculation without hitting quantile element limits."""
-    if tensor.numel() == 0:
+    if tensor is None or tensor.numel() == 0 or _is_meta(tensor):
         return tensor
     t_float = tensor.float()
     flat_abs = t_float.abs().reshape(-1)
@@ -15,58 +28,103 @@ def _winsorize(tensor: torch.Tensor, percentile: float = 0.995, max_quantile_ele
         sample = flat_abs[::step][:max_quantile_elems]
     else:
         sample = flat_abs
-    threshold = torch.quantile(sample, float(percentile))
+    q_val = max(0.0, min(1.0, float(percentile)))
+    threshold = torch.quantile(sample, q_val)
     return torch.clamp(t_float, -threshold, threshold)
 
 
-def refusal_direction(
+def _centered_contrast_svd_vh(
     pos_activations: torch.Tensor,
     neg_activations: torch.Tensor,
-    use_principal_axis: bool = True,
-) -> torch.Tensor:
-    """
-    Compute unit refusal direction where pos = refusing/restricted and neg = compliant/benign.
-    Blends principal centered singular vector with mean-contrast vector so topic drift
-    does not obscure the primary refusal axis.
-    """
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Return (diff, mean_diff, vh) for winsorized contrastive activation pairs."""
+    if pos_activations is None or neg_activations is None:
+        raise ValueError("Contrastive activation tensors must not be None.")
     if pos_activations.shape[0] != neg_activations.shape[0]:
         raise ValueError(
             f"Contrastive pairs must match 1:1, got {pos_activations.shape[0]} pos vs {neg_activations.shape[0]} neg."
         )
-    if pos_activations.shape[0] == 0:
-        raise ValueError("Need at least 1 contrastive pair to compute refusal direction.")
+    if pos_activations.shape[0] == 0 or pos_activations.numel() == 0 or neg_activations.numel() == 0:
+        raise ValueError("Need at least 1 non-empty contrastive pair to compute refusal subspace.")
 
-    diff = _winsorize(pos_activations - neg_activations)
+    dev = pos_activations.device
+    pos_f = pos_activations.float().to(dev)
+    neg_f = neg_activations.float().to(dev)
+    diff = _winsorize(pos_f - neg_f)
     mean_diff = diff.mean(dim=0)
 
-    if not use_principal_axis or diff.shape[0] < 2:
-        return (mean_diff / mean_diff.norm().clamp_min(1e-8)).contiguous()
+    if _is_meta(diff):
+        hidden = diff.shape[-1] if diff.ndim >= 1 else 1
+        eye_vh = torch.eye(1, hidden, device=dev, dtype=torch.float32)
+        return diff, mean_diff, eye_vh
+
+    if diff.shape[0] < 2:
+        unit = mean_diff / mean_diff.norm().clamp_min(1e-8)
+        return diff, mean_diff, unit.unsqueeze(0)
 
     centered = diff - mean_diff.unsqueeze(0)
     try:
         _, _, vh = torch.linalg.svd(centered, full_matrices=False)
     except RuntimeError:
         _, _, vh = torch.linalg.svd(centered.cpu(), full_matrices=False)
-        vh = vh.to(diff.device)
+        vh = vh.to(dev)
 
-    v1 = vh[0].to(diff.device)
-    if torch.dot(v1, mean_diff) < 0:
+    return diff, mean_diff, vh
+
+
+def refusal_direction(
+    pos_activations: torch.Tensor,
+    neg_activations: torch.Tensor,
+    use_principal_axis: bool = True,
+    principal_blend: float = 0.75,
+) -> torch.Tensor:
+    """
+    Compute unit refusal direction where pos = refusing/restricted and neg = compliant/benign.
+    Blends principal centered singular vector with mean-contrast vector so topic drift
+    does not obscure the primary refusal axis.
+    """
+    _, mean_diff, vh = _centered_contrast_svd_vh(pos_activations, neg_activations)
+    mean_unit = mean_diff / mean_diff.norm().clamp_min(1e-8)
+
+    if not use_principal_axis or _is_meta(vh) or vh.shape[0] == 0:
+        return mean_unit.contiguous()
+
+    v1 = vh[0].to(mean_unit.device)
+    if not _is_meta(v1) and float(torch.dot(v1, mean_diff).item()) < 0.0:
         v1 = -v1
 
-    mean_unit = mean_diff / mean_diff.norm().clamp_min(1e-8)
     v1_unit = v1 / v1.norm().clamp_min(1e-8)
-    blended = 0.75 * v1_unit + 0.25 * mean_unit
+    blend = max(0.0, min(1.0, float(principal_blend)))
+    blended = blend * v1_unit + (1.0 - blend) * mean_unit
     return (blended / blended.norm().clamp_min(1e-8)).contiguous()
 
 
 class SubspaceIsolator:
     @classmethod
-    def compute_refusal_subspace(cls, pos_activations, neg_activations, rank: int = 8) -> torch.Tensor:
-        diff = _winsorize(pos_activations - neg_activations)
-        centered = diff - diff.mean(dim=0, keepdim=True)
-        try:
-            vh = torch.linalg.svd(centered, full_matrices=False).Vh
-        except RuntimeError:
-            vh = torch.linalg.svd(centered.cpu(), full_matrices=False).Vh.to(diff.device)
-        actual = max(1, min(rank, vh.shape[0]))
+    def extract_refusal_direction(
+        cls,
+        pos_activations: torch.Tensor,
+        neg_activations: torch.Tensor,
+        use_principal_axis: bool = True,
+        principal_blend: float = 0.75,
+    ) -> torch.Tensor:
+        return refusal_direction(
+            pos_activations,
+            neg_activations,
+            use_principal_axis=use_principal_axis,
+            principal_blend=principal_blend,
+        )
+
+    @classmethod
+    def compute_refusal_subspace(
+        cls,
+        pos_activations: torch.Tensor,
+        neg_activations: torch.Tensor,
+        rank: int = 8,
+    ) -> torch.Tensor:
+        _, mean_diff, vh = _centered_contrast_svd_vh(pos_activations, neg_activations)
+        if _is_meta(vh) or vh.shape[0] == 0:
+            mean_unit = mean_diff / mean_diff.norm().clamp_min(1e-8)
+            return mean_unit.unsqueeze(0).contiguous()
+        actual = max(1, min(int(rank), vh.shape[0]))
         return vh[:actual].contiguous()
