@@ -122,7 +122,7 @@ class LatentAblateSurgeon:
 
             if "attn" in target_components and is_attn:
                 targets.append((name, W, "attn"))
-            elif "mlp" in target_components and is_mlp:
+            if "mlp" in target_components and is_mlp:
                 targets.append((name, W, "mlp"))
         return targets
 
@@ -294,6 +294,8 @@ class LatentAblateSurgeon:
                     continue
 
                 layer_device = next(layer.parameters()).device
+                if self.extractor is not None:
+                    self.extractor.device = layer_device
 
                 raw_pos = self.extractor.extract_hidden_states(pos_prompts, idx)
                 raw_neg = self.extractor.extract_hidden_states(neg_prompts, idx)
@@ -345,7 +347,7 @@ class LatentAblateSurgeon:
                 if preserve_capability and capability_prompts and len(capability_prompts) >= 2:
                     cap = self.extractor.extract_hidden_states(capability_prompts, idx)
 
-                if cap is not None and not _is_meta_tensor(cap):
+                if cap is not None and not _is_meta_tensor(cap) and cap.numel() > 0:
                     cap = cap.to(layer_device)
                     cap_basis_attn = build_capability_basis(cap, rank=basis_rank_attn).to(layer_device)
                     cap_basis_mlp = build_capability_basis(cap, rank=basis_rank_mlp).to(layer_device)

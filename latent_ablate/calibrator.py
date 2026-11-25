@@ -4,57 +4,75 @@ import torch
 logger = logging.getLogger("LatentAblate.Calibrator")
 
 
-def preserve_row_norms(modified: torch.Tensor, original: torch.Tensor, rows=None) -> torch.Tensor:
-    """Preserves row norms of modified weight matrices with strict meta-tensor safety guards."""
-    if modified is None or original is None:
-        return modified
+def estimate_free_vram_bytes(device: torch.device | str | None = None) -> int | None:
+    """Return free GPU memory in bytes when available, or None on CPU-only runs."""
+    if device is None:
+        dev = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    else:
+        dev = torch.device(device)
 
-    if modified.is_meta or original.is_meta:
-        return modified
+    if dev.type == "cuda" and torch.cuda.is_available():
+        try:
+            idx = dev.index if dev.index is not None else torch.cuda.current_device()
+            free_bytes, _total_bytes = torch.cuda.mem_get_info(idx)
+            return int(free_bytes)
+        except Exception:
+            return None
+    return None
 
-    if modified.device.type == "meta" or original.device.type == "meta":
-        return modified
 
-    if rows is not None and isinstance(rows, torch.Tensor):
-        if rows.is_meta or rows.device.type == "meta":
-            return modified
-        if rows.dtype == torch.bool:
-            try:
-                if not rows.any().item():
-                    return modified
-            except Exception:
-                return modified
+def recommend_batch_size(
+    model,
+    device: torch.device | str | None = None,
+    num_prompts: int = 16,
+    default_batch_size: int = 8,
+    max_batch_size: int = 32,
+) -> int:
+    """
+    Pick a safe batch size based on free VRAM and model hidden dimension so
+    small GPUs back off automatically and large-VRAM GPUs batch cleanly.
+    """
+    n_p = max(1, int(num_prompts))
+    base_bs = max(1, min(int(default_batch_size), int(max_batch_size), n_p))
+    free_bytes = estimate_free_vram_bytes(device)
+    if free_bytes is None:
+        return base_bs
 
+    hidden = 1024
     try:
-        orig_f = original.float()
-        mod_f = modified.float()
-        orig_norms = orig_f.norm(dim=1, keepdim=True).clamp_min(1e-8)
-        mod_norms = mod_f.norm(dim=1, keepdim=True).clamp_min(1e-8)
-        return (mod_f * (orig_norms / mod_norms)).to(dtype=modified.dtype, device=modified.device)
-    except Exception as e:
-        logger.warning(f"Error in preserve_row_norms: {e}. Returning unmodified tensor.")
-        return modified
+        cfg = getattr(model, "config", None)
+        hidden = int(getattr(cfg, "hidden_size", None) or getattr(cfg, "n_embd", None) or 1024)
+    except Exception:
+        pass
+
+    free_gib = free_bytes / (1024 ** 3)
+    if free_gib < 2.0 or hidden >= 4096:
+        chosen = 2
+    elif free_gib < 5.0 or hidden >= 2560:
+        chosen = 4
+    elif free_gib < 12.0:
+        chosen = 8
+    else:
+        chosen = min(max_batch_size, 16)
+
+    return max(1, min(chosen, n_p))
 
 
-class NormCalibrator:
-    """Class wrapper to satisfy surgeon.py imports."""
+class HardwareCalibrator:
+    """Startup profiler for batch size and memory headroom."""
 
-    @staticmethod
-    def preserve_row_norms(modified: torch.Tensor, original: torch.Tensor, rows=None) -> torch.Tensor:
-        return preserve_row_norms(modified, original, rows)
+    def __init__(self, model, device=None):
+        self.model = model
+        self.device = device
 
-
-def suggest_eval_batch_size(device: str = "cpu", free_vram_gb: float | None = None, model_params_b: float = 1.5) -> int:
-    """Suggest a safe evaluation/forward batch size based on device and model size."""
-    dev = (device or "cpu").lower()
-    if dev == "cpu":
-        return 2 if model_params_b <= 3.0 else 1
-    if free_vram_gb is None:
-        return 4 if model_params_b <= 3.0 else 2
-    if free_vram_gb >= 16.0 and model_params_b <= 4.0:
-        return 16
-    if free_vram_gb >= 8.0 and model_params_b <= 4.0:
-        return 8
-    if free_vram_gb >= 6.0:
-        return 4
-    return 2
+    def calibrate_batch_size(self, num_prompts: int, default_batch_size: int = 8) -> int:
+        bs = recommend_batch_size(
+            self.model,
+            device=self.device,
+            num_prompts=num_prompts,
+            default_batch_size=default_batch_size,
+        )
+        free_b = estimate_free_vram_bytes(self.device)
+        if free_b is not None:
+            logger.debug(f"Calibrated batch_size={bs} with {free_b / (1024**3):.2f} GiB free VRAM.")
+        return bs

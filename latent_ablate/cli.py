@@ -16,6 +16,7 @@ except ImportError:
         tomllib = None
 
 from latent_ablate.adversarial import AdversarialStressTester
+from latent_ablate.ara import AraEngine
 from latent_ablate.arch import (
     REFUSAL_MARKERS,
     eligible_linears,
@@ -24,11 +25,18 @@ from latent_ablate.arch import (
     resolve_layers,
     resolve_torch_dtype,
 )
+from latent_ablate.benchmark import run_mini_benchmark
 from latent_ablate.diagnostics import composite_trial_score, measure_layer_delta
 from latent_ablate.erasure import apply_multi_direction_erasure
 from latent_ablate.guardrail import CapabilityGuardrail
 from latent_ablate.optimizer import SubspaceOptimizer
-from latent_ablate.plugins.scorer import Context, RefusalSuppressionScorer, UtilityPerplexityScorer
+from latent_ablate.plugins.loader import load_python_plugin
+from latent_ablate.plugins.scorer import (
+    Context,
+    LogProbRefusalScorer,
+    RefusalSuppressionScorer,
+    UtilityPerplexityScorer,
+)
 from latent_ablate.profiles import BehaviorProfiles
 from latent_ablate.prompts import PromptLoader
 from latent_ablate.publisher import HuggingFacePublisher
@@ -184,10 +192,13 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p.add_argument(
         "--modifier",
-        choices=["mpoa", "cwoe", "velora", "ara", "soma", "riemannian", "sae"],
+        choices=["mpoa", "cwoe", "velora", "ara", "ara+orba", "ara_orba", "ara-orba", "ara_lbfgs", "ara-lbfgs", "ara_low_rank", "ara-low-rank", "ara_hybrid", "ara-hybrid", "low_rank_ara", "low-rank-ara", "orba", "manifold", "riemannian", "sae"],
         default="velora",
         help="Modification engine.",
     )
+    p.add_argument("--orba", action="store_true", help="Enable Orthogonal Reflection Bounded Ablation (ORBA) alongside surgery.")
+    p.add_argument("--modifier-plugin", type=str, default=None, help="Path to an external Python modifier plugin file.")
+    p.add_argument("--scorer-plugin", type=str, default=None, help="Path to an external Python scorer plugin file.")
     p.add_argument(
         "--full-stack",
         action="store_true",
@@ -233,7 +244,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--lora", action="store_true", help="Export low-rank LoRA-style adapter weights when saving.")
     p.add_argument("--lora-rank", type=int, default=16, help="Rank for LoRA-style low-rank adapter deltas.")
     p.add_argument("--compare", action="store_true", help="Print a quick baseline vs. ablated refusal/hedging and perplexity summary.")
-    p.add_argument("--profile", type=str, default=None, help="Behavior profile name.")
+    p.add_argument("--benchmark", action="store_true", help="Run a fast benign over-refusal (XSTest-style) + perplexity check and log to manifest.")
+    p.add_argument("--profile", type=str, default=None, help="Behavior profile name (e.g. direct_unfiltered, noslop, nosyco, terse, xstest).")
     p.add_argument("--prompts-file", type=str, default=None, help="Path to custom JSON or text prompt file.")
     p.add_argument("--no-anti-hedge", action="store_true", help="Disable late-layer hedging/disclaimer contrast suppression in VELORA.")
     p.add_argument("--auto-refine", action="store_true", help="Automatically run an escalating multi-layer refinement step in chat if a refusal, moralizing lecture, or deflection is detected.")
@@ -678,7 +690,7 @@ def _parse_layers_arg(raw_layers: str | None) -> list[int] | None:
 
 
 def run_quick_comparison(model, tokenizer, device, pos_prompts: list[str], cap_prompts: list[str], label: str = "Post-Surgery") -> dict:
-    sample_pos = pos_prompts[:8] if pos_prompts else []
+    sample_pos = pos_prompts[-8:] if len(pos_prompts) > 8 else (pos_prompts or [])
     sample_cap = cap_prompts[:4] if cap_prompts else []
     issues = 0
     model.eval()
@@ -845,6 +857,22 @@ def main(argv=None):
     if args.profile:
         profile_name = args.profile
 
+    custom_modifier_plugin = None
+    if args.modifier_plugin:
+        try:
+            custom_modifier_plugin = load_python_plugin(args.modifier_plugin)
+            logger.info(f"Loaded custom modifier plugin from {args.modifier_plugin}")
+        except Exception as e:
+            logger.warning(f"Failed to load modifier plugin '{args.modifier_plugin}': {e}")
+
+    custom_scorer_plugin = None
+    if args.scorer_plugin:
+        try:
+            custom_scorer_plugin = load_python_plugin(args.scorer_plugin)
+            logger.info(f"Loaded custom scorer plugin from {args.scorer_plugin}")
+        except Exception as e:
+            logger.warning(f"Failed to load scorer plugin '{args.scorer_plugin}': {e}")
+
     if args.ui:
         dashboard_path = Path(__file__).parent / "dashboard.py"
         try:
@@ -868,12 +896,33 @@ def main(argv=None):
         profile = BehaviorProfiles.get_profile(profile_name)
         pos, neg = profile["positive"], profile["negative"]
 
+    scope_spec = None
+    if args.scope_in:
+        try:
+            scope_spec = AblateScope.load_spec(args.scope_in)
+            logger.info(f"Loaded AblateScope spec from {args.scope_in}")
+            if "--alpha-attn" not in raw_argv and "recommended_alpha" in scope_spec:
+                args.alpha_attn = float(scope_spec["recommended_alpha"])
+            if "--alpha-mlp" not in raw_argv and "recommended_alpha" in scope_spec:
+                args.alpha_mlp = round(float(scope_spec["recommended_alpha"]) * 0.85, 4)
+        except Exception as e:
+            logger.warning(f"Failed to load scope spec '{args.scope_in}': {e}")
+
     reporter = SurgeryReporter(args.output_dir)
     trial_records = []
     velora_cache: dict = {}
 
     explicit_cli_layers = _parse_layers_arg(args.target_layers)
-    target_layers_list = explicit_cli_layers if explicit_cli_layers is not None else cfg_layers
+    scope_layers = (
+        [int(scope_spec["recommended_layer"])]
+        if (scope_spec and "recommended_layer" in scope_spec)
+        else None
+    )
+    target_layers_list = (
+        explicit_cli_layers
+        if explicit_cli_layers is not None
+        else (scope_layers if scope_layers is not None else cfg_layers)
+    )
 
     pareto_data = None
     if args.optimize and args.modifier == "velora":
@@ -946,7 +995,11 @@ def main(argv=None):
                         "alpha_attn": cand_alpha_attn,
                     },
                 )
-                score_refusal = RefusalSuppressionScorer().get_score(ctx)
+                score_refusal = (
+                    custom_scorer_plugin.get_score(ctx)
+                    if (custom_scorer_plugin is not None and hasattr(custom_scorer_plugin, "get_score"))
+                    else RefusalSuppressionScorer().get_score(ctx)
+                )
                 score_ppl = UtilityPerplexityScorer().get_score(ctx)
                 trial_records.append({
                     "trial_id": idx + 1,
@@ -1010,7 +1063,7 @@ def main(argv=None):
             f"adaptive_rank={args.adaptive_rank}, alpha_attn={args.alpha_attn:.2f}, alpha_mlp={args.alpha_mlp:.2f})..."
         )
 
-        for trial in range(1, args.trials + 1):
+        for trial in range(1, max(1, args.trials) + 1):
             alpha_step = 0.1 * (trial - 1) if (args.trials > 1 and not args.optimize) else 0.0
             cur_alpha_attn = max(0.0, round(args.alpha_attn + alpha_step, 4))
             cur_alpha_mlp = max(0.0, round(args.alpha_mlp + alpha_step, 4))
@@ -1072,7 +1125,39 @@ def main(argv=None):
                 print(plan)
                 return
 
-            if args.modifier == "velora":
+            mod_name = args.modifier.lower().replace("-", "_")
+            if custom_modifier_plugin is not None:
+                if hasattr(custom_modifier_plugin, "run_surgery"):
+                    custom_modifier_plugin.run_surgery(
+                        surgeon=surgeon,
+                        positive_prompts=pos,
+                        negative_prompts=neg,
+                        capability_prompts=BehaviorProfiles.CAPABILITY_PROMPTS,
+                        target_layers=valid_layers,
+                        layer_window=args.layer_window,
+                        alpha_attn=cur_alpha_attn,
+                        alpha_mlp=cur_alpha_mlp,
+                    )
+                elif callable(custom_modifier_plugin):
+                    custom_modifier_plugin(surgeon, pos, neg, BehaviorProfiles.CAPABILITY_PROMPTS, valid_layers)
+            elif mod_name.startswith("ara") or mod_name in ("low_rank_ara", "orba"):
+                AraEngine.run_ara_surgery(
+                    surgeon=surgeon,
+                    positive_prompts=pos,
+                    negative_prompts=neg,
+                    capability_prompts=BehaviorProfiles.CAPABILITY_PROMPTS,
+                    peak_position=float(valid_layers[0]),
+                    spread=max(1.5, float(args.layer_window)),
+                    alpha_attn=cur_alpha_attn,
+                    alpha_mlp=cur_alpha_mlp,
+                    basis_rank_attn=args.basis_rank_attn,
+                    basis_rank_mlp=args.basis_rank_mlp,
+                    ara_rank=max(2, args.subspace_rank),
+                    use_orba=bool(args.orba or "orba" in mod_name),
+                    adaptive_rank=args.adaptive_rank,
+                    extraction_cache=velora_cache,
+                )
+            elif mod_name == "velora":
                 VeloraEngine.run_velora_surgery(
                     surgeon=surgeon,
                     positive_prompts=pos,
@@ -1159,7 +1244,12 @@ def main(argv=None):
                 },
             )
 
-            score_refusal = RefusalSuppressionScorer().get_score(ctx)
+            if custom_scorer_plugin is not None and hasattr(custom_scorer_plugin, "get_score"):
+                score_refusal = custom_scorer_plugin.get_score(ctx)
+            elif args.trials >= 8:
+                score_refusal = LogProbRefusalScorer().get_score(ctx)
+            else:
+                score_refusal = RefusalSuppressionScorer().get_score(ctx)
             score_ppl = UtilityPerplexityScorer().get_score(ctx)
 
             trial_records.append({
@@ -1185,6 +1275,10 @@ def main(argv=None):
                 gc.collect()
                 if torch.cuda.is_available():
                     torch.cuda.empty_cache()
+
+    if not trial_records:
+        logger.error("No trial records were produced; aborting before candidate selection.")
+        return
 
     chosen_idx = interactive_trial_selector(trial_records)
     if args.compare and trial_records:
@@ -1234,12 +1328,38 @@ def main(argv=None):
             label="Ablated",
         )
 
+    benchmark_summary = None
+    if args.benchmark:
+        benchmark_summary = run_mini_benchmark(
+            model=winning_surgeon.model,
+            tokenizer=winning_surgeon.tokenizer,
+            device=winning_surgeon.device,
+            response_prefix=getattr(winning_surgeon.extractor, "response_prefix", ""),
+        )
+
     if "primary_layer" in winning_trial:
         primary_layer = int(winning_trial["primary_layer"])
     elif isinstance(raw_layers, list) and raw_layers:
         primary_layer = int(raw_layers[0])
     else:
         primary_layer = layer_index_from_ratio(len(winning_surgeon.layers), 0.62)
+
+    manifest_extra = {
+        "modifier": args.modifier,
+        "orba": args.orba,
+        "preset": args.preset,
+        "dtype": args.dtype,
+        "full_stack": args.full_stack,
+        "subspace_rank": args.subspace_rank,
+        "adaptive_rank": args.adaptive_rank,
+        "lora": args.lora,
+        "lora_rank": args.lora_rank,
+        "profile": profile_name,
+        "seed": args.seed,
+        "pareto_frontier": (pareto_data or {}).get("pareto_frontier", []),
+    }
+    if benchmark_summary is not None:
+        manifest_extra["benchmark"] = benchmark_summary
 
     manifest = build_reproducibility_manifest(
         model_path=args.model_path,
@@ -1253,19 +1373,7 @@ def main(argv=None):
             "perplexity": winning_trial["perplexity"],
             "kl_divergence": winning_trial.get("kl_divergence", 0.0),
         },
-        extra={
-            "modifier": args.modifier,
-            "preset": args.preset,
-            "dtype": args.dtype,
-            "full_stack": args.full_stack,
-            "subspace_rank": args.subspace_rank,
-            "adaptive_rank": args.adaptive_rank,
-            "lora": args.lora,
-            "lora_rank": args.lora_rank,
-            "profile": profile_name,
-            "seed": args.seed,
-            "pareto_frontier": (pareto_data or {}).get("pareto_frontier", []),
-        },
+        extra=manifest_extra,
     )
 
     _handle_post_run(args, winning_surgeon, reporter, pos, primary_layer, manifest)

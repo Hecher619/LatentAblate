@@ -1,25 +1,35 @@
 import importlib.util
-from pathlib import Path
 import logging
+from pathlib import Path
 
 logger = logging.getLogger("LatentAblate.PluginLoader")
 
-class PluginLoader:
-    @staticmethod
-    def load_plugin_from_file(file_path: str, base_class):
-        path = Path(file_path).expanduser().resolve()
-        if not path.exists():
-            raise FileNotFoundError(f"Plugin file not found: {path}")
 
-        logger.info(f"Dynamically loading plugin from {path}...")
-        spec = importlib.util.spec_from_file_location(path.stem, path)
-        module = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(module)
+def load_python_plugin(plugin_path: str, expected_attr: str | None = None):
+    """
+    Dynamically loads a Python module from `plugin_path` and resolves a plugin entry
+    object/callable (`Plugin`, `Scorer`, `Modifier`, or `expected_attr`).
+    """
+    path = Path(plugin_path)
+    if not path.exists() or not path.is_file():
+        raise FileNotFoundError(f"Plugin file not found: {plugin_path}")
 
-        for attr_name in dir(module):
-            attr = getattr(module, attr_name)
-            if isinstance(attr, type) and issubclass(attr, base_class) and attr is not base_class:
-                logger.info(f"Successfully loaded plugin class: {attr.__name__}")
-                return attr
+    module_name = f"latent_ablate_ext_{path.stem}_{abs(hash(str(path.resolve())))}"
+    spec = importlib.util.spec_from_file_location(module_name, str(path))
+    if spec is None or spec.loader is None:
+        raise ImportError(f"Could not create module spec for plugin: {plugin_path}")
 
-        raise ValueError(f"No valid subclass of {base_class.__name__} found in {path}")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+
+    candidates = []
+    if expected_attr:
+        candidates.append(expected_attr)
+    candidates.extend(["Plugin", "Modifier", "Scorer", "get_plugin", "run_surgery", "get_score"])
+
+    for attr in candidates:
+        if hasattr(module, attr):
+            obj = getattr(module, attr)
+            return obj() if isinstance(obj, type) else obj
+
+    return module

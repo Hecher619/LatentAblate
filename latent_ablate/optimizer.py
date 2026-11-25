@@ -95,7 +95,7 @@ class SubspaceOptimizer:
         lo_layer = layer_index_from_ratio(n_layers, 0.35)
         hi_layer = max(lo_layer, layer_index_from_ratio(n_layers, 0.80))
         resp_prefix = getattr(surgeon.extractor, "response_prefix", "")
-        eval_prompts = positive_prompts[:8] if len(positive_prompts) > 8 else positive_prompts
+        eval_prompts = positive_prompts[-8:] if len(positive_prompts) > 8 else positive_prompts
         cap_subset = capability_prompts[:3]
 
         base_logits_list = []
@@ -219,12 +219,13 @@ def select_best_trial_index(trials: list[dict], baseline_perplexity: float | Non
 
     best_idx = 0
     best_score = float("inf")
+    ppl_ref = float(baseline_perplexity) if (baseline_perplexity is not None and baseline_perplexity > 0) else 20.0
     for i, t in enumerate(trials):
         score = composite_trial_score(
             refusal_rate=float(t.get("refusal_rate", 1.0)),
             perplexity=float(t.get("perplexity", 100.0)),
             kl_divergence=float(t.get("kl_divergence", 0.0)),
-            baseline_perplexity=baseline_perplexity,
+            ppl_ref=ppl_ref,
         )
         if score < best_score:
             best_score = score

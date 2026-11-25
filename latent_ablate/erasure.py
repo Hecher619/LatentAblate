@@ -78,12 +78,70 @@ def orthogonalize_against_basis(
     if b.shape[0] == 0 or b.shape[-1] != d.shape[-1]:
         return d
 
-    proj = b.T @ (b @ d)
+    try:
+        q, _ = torch.linalg.qr(b.T, mode="reduced")
+    except RuntimeError:
+        q, _ = torch.linalg.qr(b.T.cpu(), mode="reduced")
+        q = q.to(d.device)
+
+    proj = q @ (q.T @ d)
     ortho = d - proj
     norm = ortho.norm()
     if float(norm.item()) <= 1e-6:
-        return d
+        # Direction is nearly collinear with capability basis; return zero vector so it is not applied.
+        return torch.zeros_like(d)
     return ortho / norm.clamp_min(eps)
+
+
+def oblique_weights(
+    direction: torch.Tensor,
+    capability_basis: torch.Tensor | None,
+    eps: float = 1e-8,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    Returns `(unit_dir, ortho_dir)` where `unit_dir` is the normalized raw direction
+    and `ortho_dir` is projected orthogonal to `capability_basis`.
+    """
+    unit_dir = _normalize_1d(direction, eps=eps)
+    ortho_dir = orthogonalize_against_basis(unit_dir, capability_basis, eps=eps)
+    return unit_dir, ortho_dir
+
+
+def select_energy_rank(
+    pos_activations: torch.Tensor,
+    neg_activations: torch.Tensor,
+    max_rank: int = 8,
+    target_energy: float = 0.85,
+) -> int:
+    """Selects minimal rank capturing `target_energy` of centered contrastive variance."""
+    if pos_activations is None or neg_activations is None or _is_meta(pos_activations) or _is_meta(neg_activations):
+        return 1
+    n_pairs = min(pos_activations.shape[0], neg_activations.shape[0])
+    if n_pairs < 2:
+        return 1
+
+    diff = pos_activations[:n_pairs].float() - neg_activations[:n_pairs].float()
+    centered = diff - diff.mean(dim=0, keepdim=True)
+    try:
+        _, svals, _ = torch.linalg.svd(centered, full_matrices=False)
+    except RuntimeError:
+        _, svals, _ = torch.linalg.svd(centered.cpu(), full_matrices=False)
+
+    if svals.numel() == 0:
+        return 1
+
+    upper = max(1, min(int(max_rank), int(svals.shape[0])))
+    energies = (svals[:upper] ** 2)
+    total = float(energies.sum().item())
+    if total <= 1e-12:
+        return 1
+
+    cum = torch.cumsum(energies, dim=0) / total
+    thresh = max(0.05, min(1.0, float(target_energy)))
+    for idx in range(upper):
+        if float(cum[idx].item()) >= thresh:
+            return idx + 1
+    return upper
 
 
 def conflict_score(
@@ -173,6 +231,9 @@ def project_out_subspace(
     w_f = weight.float()
     dev = w_f.device
     v = orthogonalize_against_basis(direction.to(dev), capability_basis)
+    if float(v.norm().item()) <= 1e-8:
+        return weight
+
     eff_alpha = max(0.0, float(alpha))
 
     if w_f.ndim == 1:
@@ -197,6 +258,27 @@ def project_out_subspace(
     if calibrate_norms:
         out = preserve_row_norms(w_f, out)
     return out.to(dtype=weight.dtype, device=weight.device)
+
+
+def apply_erasure(
+    weight: torch.Tensor,
+    direction: torch.Tensor,
+    _weights_or_basis=None,
+    alpha: float = 1.0,
+    capability_basis: torch.Tensor | None = None,
+    calibrate_norms: bool = True,
+) -> torch.Tensor:
+    """Compatibility wrapper for rank-1 directional erasure."""
+    cap = capability_basis if capability_basis is not None else (
+        _weights_or_basis if isinstance(_weights_or_basis, torch.Tensor) else None
+    )
+    return project_out_subspace(
+        weight=weight,
+        direction=direction,
+        alpha=alpha,
+        capability_basis=cap,
+        calibrate_norms=calibrate_norms,
+    )
 
 
 def apply_multi_direction_erasure(
