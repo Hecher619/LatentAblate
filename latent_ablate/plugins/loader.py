@@ -33,3 +33,17 @@ def load_python_plugin(plugin_path: str, expected_attr: str | None = None):
             return obj() if isinstance(obj, type) else obj
 
     return module
+
+
+class PluginLoader:
+    """Compatibility loader wrapper around load_python_plugin."""
+
+    def __init__(self, *args, **kwargs):
+        self.args = args
+        self.kwargs = kwargs
+
+    def load(self, path, *args, **kwargs):
+        return load_python_plugin(path, *args, **kwargs)
+
+    def __call__(self, path, *args, **kwargs):
+        return self.load(path, *args, **kwargs)
