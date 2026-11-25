@@ -36,7 +36,7 @@ From Source & Viewing Help
 git clone https://github.com/Hecher619/LatentAblate.git
 cd LatentAblate
 pip install -r requirements.txt
-python -m latent_ablate.cli -h
+python -m latent_ablate.cli --h 
 
 Run a Sweep or Load Locally from Cache
 python -m latent_ablate.cli --trials 3 --interactive
