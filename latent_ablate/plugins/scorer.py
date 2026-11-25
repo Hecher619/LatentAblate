@@ -218,3 +218,7 @@ class UtilityPerplexityScorer:
             return ScoreResult(name=self.name, value=0.0, details={"count": 0})
         ppl = ModelValidator.calculate_perplexity(ctx.model, ctx.tokenizer, cap_texts, ctx.device)
         return ScoreResult(name=self.name, value=round(float(ppl), 4), details={"count": len(cap_texts)})
+
+
+Scorer = RefusalSuppressionScorer
+Score = ScoreResult
