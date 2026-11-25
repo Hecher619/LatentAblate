@@ -1916,7 +1916,6 @@ class VeloraEngine:
             "pareto_frontier": frontier,
             "trials": final_pool,
         }
-EOF
 cat <<'EOF' > latent_ablate/velora.py
 import logging
 import math
